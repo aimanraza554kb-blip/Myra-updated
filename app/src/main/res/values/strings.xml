@@ -1,0 +1,11 @@
+<resources>
+    <string name="app_name">MYRA</string>
+    <string name="assistant_tagline">Your always-on AI</string>
+    <string name="fgs_channel_name">MYRA Assistant</string>
+    <string name="fgs_channel_desc">Keeps MYRA listening in the background</string>
+    <string name="fgs_notification_title">MYRA is active</string>
+    <string name="fgs_notification_text">Tap to open your assistant</string>
+    <string name="accessibility_description">MYRA uses accessibility to open, close and control apps on your command.</string>
+    <string name="wake_word">Hey MYRA</string>
+    <string name="action_stop">Stop</string>
+</resources>

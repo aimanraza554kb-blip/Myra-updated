@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="myra_black">#FF05050A</color>
+    <color name="myra_red">#FFFF2E63</color>
+    <color name="myra_purple">#FF9D4EDD</color>
+    <color name="myra_purple_deep">#FF6A00F4</color>
+    <color name="white">#FFFFFFFF</color>
+    <color name="black">#FF000000</color>
+    <color name="ic_launcher_background">#FF05050A</color>
+</resources>
