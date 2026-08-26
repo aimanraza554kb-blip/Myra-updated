@@ -24,9 +24,6 @@ import java.util.concurrent.atomic.AtomicBoolean
  * WebSocket client for the Gemini Live API (BidiGenerateContent). Handles setup,
  * streaming PCM audio in/out, input/output transcription, interruptions,
  * automatic reconnect with backoff, keepalive pings and periodic session renewal.
- *
- * The model selected in Settings is used directly.
- * No automatic model discovery or model switching is performed.
  */
 class GeminiLiveClient(
     private val scope: CoroutineScope,
@@ -46,37 +43,33 @@ class GeminiLiveClient(
     private var reconnectAttempts = 0
     private var renewJob: Job? = null
 
-    // True ONLY between receiving setupComplete and the socket closing.
-    // Every realtimeInput / clientContent / toolResponse must wait for this.
+    // True ONLY between receiving setupComplete and the socket closing. Every
+    // realtimeInput / clientContent / toolResponse must wait for this. Sending
+    // anything before the setup handshake finishes makes the Live API close the
+    // socket with code 1007 ("invalid argument"). Because the mic streams
+    // continuously across the 9-minute session renewal and across reconnects,
+    // this gate is what actually prevents the mid-session 1007 disconnect loop.
     private val sessionReady = AtomicBoolean(false)
-
     // Prevents overlapping (re)connect attempts from opening duplicate sockets.
     private val connecting = AtomicBoolean(false)
-
     // Remembers the last frame type sent, so a 1007 close names the culprit.
-    @Volatile
-    private var lastOutgoingLabel: String = "none"
+    @Volatile private var lastOutgoingLabel: String = "none"
 
     /**
      * Single choke-point for every outgoing frame: refuses to send on a dead or
-     * not-yet-ready socket, never throws, and logs what was sent.
+     * not-yet-ready socket, never throws, and logs what was sent (audio frames
+     * are counted rather than dumped to avoid flooding the log).
      */
     private fun safeSend(message: String, label: String): Boolean {
         val ws = webSocket ?: run {
             Logger.w(TAG, "Drop '$label': no active socket")
             return false
         }
-
         return try {
             lastOutgoingLabel = label
             val queued = ws.send(message)
-
-            if (!queued) {
-                Logger.w(TAG, "Drop '$label': send buffer full or socket closing")
-            } else if (label != "audio") {
-                Logger.d(TAG, "-> $label (${message.length} bytes)")
-            }
-
+            if (!queued) Logger.w(TAG, "Drop '$label': send buffer full or socket closing")
+            else if (label != "audio") Logger.d(TAG, "-> $label (${message.length} bytes)")
             queued
         } catch (e: Exception) {
             Logger.e(TAG, "Send failed for '$label'", e)
@@ -88,10 +81,9 @@ class GeminiLiveClient(
         this.config = config
         running.set(true)
         reconnectAttempts = 0
-
-        // IMPORTANT:
-        // Use the model selected in Settings directly.
-        // Do NOT query ListModels and do NOT replace the selected model.
+        // Keep the original working Live model selected by Settings.
+        // Do not auto-discover/switch models here: ListModels can expose preview
+        // models that are not valid for this Live WebSocket/API-version path.
         scope.launch(Dispatchers.IO) {
             openSocket()
         }
@@ -99,652 +91,262 @@ class GeminiLiveClient(
 
     private fun openSocket() {
         val cfg = config ?: return
-
         if (cfg.apiKey.isBlank()) {
-            onEvent(
-                GeminiEvent.Error(
-                    "Gemini API key is missing. Add it in Settings."
-                )
-            )
+            onEvent(GeminiEvent.Error("Gemini API key is missing. Add it in Settings."))
             return
         }
-
-        // Only one connection attempt at a time.
+        // Only one connection attempt at a time; the guard is released in
+        // onOpen/onFailure/onClosed.
         if (!connecting.compareAndSet(false, true)) {
-            Logger.w(
-                TAG,
-                "openSocket ignored: a connection attempt is already in progress"
-            )
+            Logger.w(TAG, "openSocket ignored: a connection attempt is already in progress")
             return
         }
-
-        // Always start a BRAND-NEW session.
+        // Always start a BRAND-NEW session: block sends until the new handshake
+        // completes and fully discard the previous socket so we never reuse a
+        // half-dead session or leak a stale reference.
         sessionReady.set(false)
-
         webSocket?.let { old ->
             webSocket = null
-            try {
-                old.cancel()
-            } catch (_: Exception) {
-            }
+            try { old.cancel() } catch (_: Exception) {}
         }
-
         val url = Constants.GEMINI_WS_HOST + "?key=" + cfg.apiKey
-        val request = Request.Builder()
-            .url(url)
-            .build()
-
-        Logger.i(TAG, "Opening Gemini Live socket with model: ${cfg.model}")
-
-        onEvent(
-            GeminiEvent.StateChanged(
-                ConnectionState.CONNECTING
-            )
-        )
-
-        webSocket = http.newWebSocket(
-            request,
-            listener
-        )
+        val request = Request.Builder().url(url).build()
+        onEvent(GeminiEvent.StateChanged(ConnectionState.CONNECTING))
+        webSocket = http.newWebSocket(request, listener)
     }
 
     private val listener = object : WebSocketListener() {
-
-        override fun onOpen(
-            ws: WebSocket,
-            response: Response
-        ) {
+        override fun onOpen(ws: WebSocket, response: Response) {
             connecting.set(false)
-
             Logger.i(TAG, "WebSocket open")
-
             reconnectAttempts = 0
-
-            // Setup MUST be the first frame.
-            // sessionReady stays false until setupComplete.
+            // Setup MUST be the first frame; sessionReady stays false until the
+            // server acknowledges it with setupComplete.
             sendSetup(ws)
-
             scheduleRenew()
-
             onEvent(GeminiEvent.Connected)
         }
 
-        override fun onMessage(
-            ws: WebSocket,
-            text: String
-        ) = handleMessage(text)
+        override fun onMessage(ws: WebSocket, text: String) = handleMessage(text)
 
-        override fun onMessage(
-            ws: WebSocket,
-            bytes: ByteString
-        ) = handleMessage(bytes.utf8())
+        override fun onMessage(ws: WebSocket, bytes: ByteString) = handleMessage(bytes.utf8())
 
-        override fun onClosing(
-            ws: WebSocket,
-            code: Int,
-            reason: String
-        ) {
-            ws.close(
-                NORMAL_CLOSURE,
-                null
-            )
+        override fun onClosing(ws: WebSocket, code: Int, reason: String) {
+            ws.close(NORMAL_CLOSURE, null)
         }
 
-        override fun onClosed(
-            ws: WebSocket,
-            code: Int,
-            reason: String
-        ) {
+        override fun onClosed(ws: WebSocket, code: Int, reason: String) {
             sessionReady.set(false)
             connecting.set(false)
-
-            Logger.i(
-                TAG,
-                "WebSocket closed: $code '$reason' " +
-                    "(last frame sent: $lastOutgoingLabel)"
-            )
-
+            Logger.i(TAG, "WebSocket closed: $code '$reason' (last frame sent: $lastOutgoingLabel)")
             val renewing = reason == "renew"
-
-            if (
-                code != NORMAL_CLOSURE &&
-                reason.isNotBlank() &&
-                !renewing
-            ) {
-                onEvent(
-                    GeminiEvent.Error(
-                        "Server closed ($code): $reason"
-                    )
-                )
+            if (code != NORMAL_CLOSURE && reason.isNotBlank() && !renewing) {
+                onEvent(GeminiEvent.Error("Server closed ($code): $reason"))
             }
-
-            // Planned renewal reconnects immediately.
-            // Genuine drops use exponential backoff.
-            if (running.get()) {
-                reconnect(immediate = renewing)
-            } else {
-                onEvent(GeminiEvent.Closed)
-            }
+            // A planned session renewal should reconnect instantly and silently;
+            // only genuine drops use exponential backoff.
+            if (running.get()) reconnect(immediate = renewing) else onEvent(GeminiEvent.Closed)
         }
 
-        override fun onFailure(
-            ws: WebSocket,
-            t: Throwable,
-            response: Response?
-        ) {
+        override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
             sessionReady.set(false)
             connecting.set(false)
-
             val detail = buildString {
-                append(
-                    t.message ?: "Connection failed"
-                )
-
+                append(t.message ?: "Connection failed")
                 response?.let { r ->
-                    append(" (HTTP ")
-                        .append(r.code)
-                        .append(")")
-
+                    append(" (HTTP ").append(r.code).append(")")
                     try {
-                        r.body
-                            ?.string()
-                            ?.takeIf { it.isNotBlank() }
-                            ?.let {
-                                append(": ")
-                                    .append(it.take(300))
-                            }
+                        r.body?.string()?.takeIf { it.isNotBlank() }?.let { append(": ").append(it.take(300)) }
                     } catch (_: Exception) {
                     }
                 }
             }
-
-            Logger.e(
-                TAG,
-                "WebSocket failure: $detail",
-                t
-            )
-
-            onEvent(
-                GeminiEvent.Error(detail)
-            )
-
-            if (running.get()) {
-                reconnect()
-            }
+            Logger.e(TAG, "WebSocket failure: $detail", t)
+            onEvent(GeminiEvent.Error(detail))
+            if (running.get()) reconnect()
         }
     }
 
     private fun sendSetup(ws: WebSocket) {
         val cfg = config ?: return
-
         val speechConfig = JSONObject().put(
             "voiceConfig",
-            JSONObject().put(
-                "prebuiltVoiceConfig",
-                JSONObject().put(
-                    "voiceName",
-                    cfg.voiceName
-                )
-            )
+            JSONObject().put("prebuiltVoiceConfig", JSONObject().put("voiceName", cfg.voiceName))
         )
-
         val generationConfig = JSONObject()
-            .put(
-                "responseModalities",
-                JSONArray().put("AUDIO")
-            )
-            .put(
-                "speechConfig",
-                speechConfig
-            )
+            .put("responseModalities", JSONArray().put("AUDIO"))
+            .put("speechConfig", speechConfig)
 
         val setup = JSONObject()
-            // IMPORTANT:
-            // This is the exact model selected in Settings.
-            // There is NO fallback to another model.
-            .put(
-                "model",
-                "models/" + cfg.model
-            )
-            .put(
-                "generationConfig",
-                generationConfig
-            )
-            .put(
-                "systemInstruction",
-                JSONObject().put(
-                    "parts",
-                    JSONArray().put(
-                        JSONObject().put(
-                            "text",
-                            cfg.systemInstruction
-                        )
-                    )
-                )
-            )
-            .put(
-                "inputAudioTranscription",
-                JSONObject()
-            )
-            .put(
-                "outputAudioTranscription",
-                JSONObject()
-            )
+            .put("model", "models/" + cfg.model)
+            .put("generationConfig", generationConfig)
+            .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", cfg.systemInstruction))))
+            .put("inputAudioTranscription", JSONObject())
+            .put("outputAudioTranscription", JSONObject())
+            // Low-latency turn-taking: as soon as the user stops speaking we want a
+            // reply almost immediately. Only the numeric VAD fields are set here.
+            // NOTE: do NOT add startOfSpeechSensitivity/endOfSpeechSensitivity enums
+            // - those were rejected by the Live API with close code 1007 ("invalid
+            // argument"). The disabled/prefixPaddingMs/silenceDurationMs shape below
+            // matches Google's documented working setup.
             .put(
                 "realtimeInputConfig",
                 JSONObject().put(
                     "automaticActivityDetection",
                     JSONObject()
-                        .put(
-                            "disabled",
-                            false
-                        )
-                        .put(
-                            "prefixPaddingMs",
-                            10
-                        )
-                        .put(
-                            "silenceDurationMs",
-                            40
-                        )
+                        .put("disabled", false)
+                        .put("prefixPaddingMs", 10)
+                        // Practically the floor: commit end-of-turn after ~2 silent
+                        // 20ms frames so MYRA starts replying almost instantly. Going
+                        // lower risks cutting the user off during natural pauses.
+                        .put("silenceDurationMs", 40)
                 )
             )
 
-        cfg.toolsJson
-            ?.takeIf { it.isNotBlank() }
-            ?.let {
-                setup.put(
-                    "tools",
-                    JSONArray(it)
-                )
-            }
+        cfg.toolsJson?.takeIf { it.isNotBlank() }?.let { setup.put("tools", JSONArray(it)) }
 
-        val message = JSONObject()
-            .put(
-                "setup",
-                setup
-            )
-
-        // Setup is the handshake and therefore bypasses sessionReady.
+        val message = JSONObject().put("setup", setup)
+        // Sent directly on the freshly opened socket (this IS the handshake, so it
+        // bypasses the sessionReady gate). Wrapped so a send failure can't crash.
         try {
             lastOutgoingLabel = "setup"
-
-            ws.send(
-                message.toString()
-            )
-
-            Logger.d(
-                TAG,
-                "-> setup for model ${cfg.model}"
-            )
+            ws.send(message.toString())
+            Logger.d(TAG, "-> setup for model ${cfg.model}")
         } catch (e: Exception) {
-            Logger.e(
-                TAG,
-                "Setup send failed",
-                e
-            )
+            Logger.e(TAG, "Setup send failed", e)
         }
     }
 
     /** Stream a chunk of 16kHz mono PCM16 microphone audio to Gemini. */
     fun sendAudio(pcm: ByteArray) {
-        // Never stream before setupComplete.
+        // Root-cause guard: never stream audio until the current session's setup
+        // handshake is acknowledged. This is what stops the mic from hitting a
+        // freshly-reconnected/renewed socket before setupComplete (the 1007).
         if (!sessionReady.get()) return
-
-        // PCM16 = 2 bytes/sample.
+        // Never forward empty or misaligned frames (PCM16 = 2 bytes/sample).
         if (pcm.isEmpty() || pcm.size % 2 != 0) return
-
-        val b64 = Base64.encodeToString(
-            pcm,
-            Base64.NO_WRAP
-        )
-
+        val b64 = Base64.encodeToString(pcm, Base64.NO_WRAP)
         if (b64.isBlank()) return
-
         val chunk = JSONObject()
-            .put(
-                "mimeType",
-                "audio/pcm;rate=" +
-                    Constants.INPUT_SAMPLE_RATE
-            )
-            .put(
-                "data",
-                b64
-            )
-
+            .put("mimeType", "audio/pcm;rate=" + Constants.INPUT_SAMPLE_RATE)
+            .put("data", b64)
         val message = JSONObject().put(
             "realtimeInput",
-            JSONObject().put(
-                "mediaChunks",
-                JSONArray().put(chunk)
-            )
+            JSONObject().put("mediaChunks", JSONArray().put(chunk))
         )
-
-        safeSend(
-            message.toString(),
-            "audio"
-        )
+        safeSend(message.toString(), "audio")
     }
 
-    /** Send a typed text turn. */
+    /** Send a typed text turn (used by the chat input box). */
     fun sendText(text: String) {
-        if (!sessionReady.get()) {
-            Logger.w(
-                TAG,
-                "Drop text: session not ready"
-            )
-            return
-        }
-
+        if (!sessionReady.get()) { Logger.w(TAG, "Drop text: session not ready"); return }
         if (text.isBlank()) return
-
         val turn = JSONObject()
-            .put(
-                "role",
-                "user"
-            )
-            .put(
-                "parts",
-                JSONArray().put(
-                    JSONObject().put(
-                        "text",
-                        text
-                    )
-                )
-            )
-
+            .put("role", "user")
+            .put("parts", JSONArray().put(JSONObject().put("text", text)))
         val message = JSONObject().put(
             "clientContent",
-            JSONObject()
-                .put(
-                    "turns",
-                    JSONArray().put(turn)
-                )
-                .put(
-                    "turnComplete",
-                    true
-                )
+            JSONObject().put("turns", JSONArray().put(turn)).put("turnComplete", true)
         )
-
-        safeSend(
-            message.toString(),
-            "text"
-        )
+        safeSend(message.toString(), "text")
     }
 
-    /** Send function-call results back to the model. */
-    fun sendToolResponse(
-        responses: List<GeminiFunctionResponse>
-    ) {
-        if (!sessionReady.get()) {
-            Logger.w(
-                TAG,
-                "Drop toolResponse: session not ready"
-            )
-            return
-        }
-
+    /** Send function-call results back to the model so it can finish the turn. */
+    fun sendToolResponse(responses: List<GeminiFunctionResponse>) {
+        if (!sessionReady.get()) { Logger.w(TAG, "Drop toolResponse: session not ready"); return }
         if (responses.isEmpty()) return
-
         val arr = JSONArray()
-
         responses.forEach { r ->
             val fr = JSONObject()
-                .put(
-                    "name",
-                    r.name
-                )
-                .put(
-                    "response",
-                    JSONObject().put(
-                        "result",
-                        r.result
-                    )
-                )
-
-            // Only include id when one actually exists.
-            if (r.id.isNotBlank()) {
-                fr.put(
-                    "id",
-                    r.id
-                )
-            }
-
+                .put("name", r.name)
+                .put("response", JSONObject().put("result", r.result))
+            // Only include id when the matching function call actually had one;
+            // an empty id is an invalid argument.
+            if (r.id.isNotBlank()) fr.put("id", r.id)
             arr.put(fr)
         }
-
-        val message = JSONObject().put(
-            "toolResponse",
-            JSONObject().put(
-                "functionResponses",
-                arr
-            )
-        )
-
-        safeSend(
-            message.toString(),
-            "toolResponse"
-        )
+        val message = JSONObject().put("toolResponse", JSONObject().put("functionResponses", arr))
+        safeSend(message.toString(), "toolResponse")
     }
 
     private fun handleMessage(raw: String) {
         try {
             val obj = JSONObject(raw)
-
             if (obj.has("setupComplete")) {
-                // Handshake complete.
+                // Handshake done: it is now safe to stream audio and tool results.
                 sessionReady.set(true)
-
-                onEvent(
-                    GeminiEvent.SetupComplete
-                )
-
+                onEvent(GeminiEvent.SetupComplete)
                 return
             }
-
             if (obj.has("toolCall")) {
-                val fcs = obj
-                    .getJSONObject("toolCall")
-                    .optJSONArray("functionCalls")
-
+                val fcs = obj.getJSONObject("toolCall").optJSONArray("functionCalls")
                 if (fcs != null) {
-                    val calls =
-                        ArrayList<GeminiFunctionCall>()
-
+                    val calls = ArrayList<GeminiFunctionCall>()
                     for (i in 0 until fcs.length()) {
-                        val c =
-                            fcs.getJSONObject(i)
-
+                        val c = fcs.getJSONObject(i)
                         calls.add(
                             GeminiFunctionCall(
                                 c.optString("id"),
                                 c.optString("name"),
-                                c.optJSONObject("args")
-                                    ?: JSONObject()
+                                c.optJSONObject("args") ?: JSONObject()
                             )
                         )
                     }
-
-                    if (calls.isNotEmpty()) {
-                        onEvent(
-                            GeminiEvent.ToolCall(calls)
-                        )
-                    }
+                    if (calls.isNotEmpty()) onEvent(GeminiEvent.ToolCall(calls))
                 }
-
                 return
             }
-
             if (obj.has("serverContent")) {
-                val sc =
-                    obj.getJSONObject("serverContent")
-
-                if (
-                    sc.optBoolean(
-                        "interrupted",
-                        false
-                    )
-                ) {
-                    onEvent(
-                        GeminiEvent.Interrupted
-                    )
-                }
-
-                sc.optJSONObject(
-                    "inputTranscription"
-                )
-                    ?.optString("text")
-                    ?.takeIf { it.isNotEmpty() }
-                    ?.let {
-                        onEvent(
-                            GeminiEvent.InputTranscript(it)
-                        )
-                    }
-
-                sc.optJSONObject(
-                    "outputTranscription"
-                )
-                    ?.optString("text")
-                    ?.takeIf { it.isNotEmpty() }
-                    ?.let {
-                        onEvent(
-                            GeminiEvent.OutputTranscript(it)
-                        )
-                    }
-
-                sc.optJSONObject(
-                    "modelTurn"
-                )
-                    ?.optJSONArray("parts")
-                    ?.let { parts ->
-
-                        for (i in 0 until parts.length()) {
-                            val part =
-                                parts.getJSONObject(i)
-
-                            part.optJSONObject(
-                                "inlineData"
-                            )?.let { data ->
-
-                                val mime =
-                                    data.optString(
-                                        "mimeType",
-                                        ""
-                                    )
-
-                                if (
-                                    mime.startsWith(
-                                        "audio"
-                                    )
-                                ) {
-                                    val pcm =
-                                        Base64.decode(
-                                            data.getString(
-                                                "data"
-                                            ),
-                                            Base64.NO_WRAP
-                                        )
-
-                                    onEvent(
-                                        GeminiEvent.AudioChunk(
-                                            pcm
-                                        )
-                                    )
-                                }
+                val sc = obj.getJSONObject("serverContent")
+                if (sc.optBoolean("interrupted", false)) onEvent(GeminiEvent.Interrupted)
+                sc.optJSONObject("inputTranscription")?.optString("text")?.takeIf { it.isNotEmpty() }
+                    ?.let { onEvent(GeminiEvent.InputTranscript(it)) }
+                sc.optJSONObject("outputTranscription")?.optString("text")?.takeIf { it.isNotEmpty() }
+                    ?.let { onEvent(GeminiEvent.OutputTranscript(it)) }
+                sc.optJSONObject("modelTurn")?.optJSONArray("parts")?.let { parts ->
+                    for (i in 0 until parts.length()) {
+                        val part = parts.getJSONObject(i)
+                        part.optJSONObject("inlineData")?.let { data ->
+                            val mime = data.optString("mimeType", "")
+                            if (mime.startsWith("audio")) {
+                                val pcm = Base64.decode(data.getString("data"), Base64.NO_WRAP)
+                                onEvent(GeminiEvent.AudioChunk(pcm))
                             }
-
-                            // Do NOT emit modelTurn text here.
-                            // With AUDIO response modality the spoken
-                            // response arrives through outputTranscription.
                         }
+                        // Intentionally NOT emitting modelTurn text parts here. With an
+                        // AUDIO response modality the spoken reply already streams in via
+                        // outputTranscription; emitting the text too would duplicate MYRA's
+                        // transcript on screen.
                     }
-
-                if (
-                    sc.optBoolean(
-                        "turnComplete",
-                        false
-                    )
-                ) {
-                    onEvent(
-                        GeminiEvent.TurnComplete
-                    )
                 }
+                if (sc.optBoolean("turnComplete", false)) onEvent(GeminiEvent.TurnComplete)
             }
-
         } catch (e: Exception) {
-            Logger.e(
-                TAG,
-                "Failed to parse message",
-                e
-            )
+            Logger.e(TAG, "Failed to parse message", e)
         }
     }
 
-    private fun reconnect(
-        immediate: Boolean = false
-    ) {
-        onEvent(
-            GeminiEvent.StateChanged(
-                ConnectionState.RECONNECTING
-            )
-        )
-
+    private fun reconnect(immediate: Boolean = false) {
+        onEvent(GeminiEvent.StateChanged(ConnectionState.RECONNECTING))
         renewJob?.cancel()
-
         scope.launch(Dispatchers.IO) {
-
-            val delayMs =
-                if (immediate) {
-                    0L
-                } else {
-                    (
-                        Constants.RECONNECT_BASE_DELAY_MS *
-                            (
-                                1L shl
-                                    reconnectAttempts
-                                        .coerceAtMost(5)
-                            )
-                    ).coerceAtMost(
-                        Constants.RECONNECT_MAX_DELAY_MS
-                    )
-                }
-
-            if (!immediate) {
-                reconnectAttempts++
-            }
-
-            Logger.i(
-                TAG,
-                "Reconnecting in ${delayMs}ms " +
-                    "(attempt $reconnectAttempts)"
-            )
-
+            val delayMs = if (immediate) 0L else
+                (Constants.RECONNECT_BASE_DELAY_MS * (1L shl reconnectAttempts.coerceAtMost(5)))
+                    .coerceAtMost(Constants.RECONNECT_MAX_DELAY_MS)
+            if (!immediate) reconnectAttempts++
+            Logger.i(TAG, "Reconnecting in ${delayMs}ms (attempt $reconnectAttempts)")
             delay(delayMs)
-
-            if (running.get()) {
-                openSocket()
-            }
+            if (running.get()) openSocket()
         }
     }
 
     private fun scheduleRenew() {
         renewJob?.cancel()
-
         renewJob = scope.launch {
-            delay(
-                Constants.SESSION_RENEW_MS
-            )
-
+            delay(Constants.SESSION_RENEW_MS)
             if (running.get()) {
-                Logger.i(
-                    TAG,
-                    "Renewing session"
-                )
-
-                webSocket?.close(
-                    NORMAL_CLOSURE,
-                    "renew"
-                )
+                Logger.i(TAG, "Renewing session")
+                webSocket?.close(NORMAL_CLOSURE, "renew")
             }
         }
     }
@@ -753,33 +355,14 @@ class GeminiLiveClient(
         running.set(false)
         sessionReady.set(false)
         connecting.set(false)
-
         renewJob?.cancel()
-
-        webSocket?.let {
-            try {
-                it.close(
-                    NORMAL_CLOSURE,
-                    "client closed"
-                )
-            } catch (_: Exception) {
-            }
-        }
-
+        webSocket?.let { try { it.close(NORMAL_CLOSURE, "client closed") } catch (_: Exception) {} }
         webSocket = null
-
-        onEvent(
-            GeminiEvent.StateChanged(
-                ConnectionState.IDLE
-            )
-        )
+        onEvent(GeminiEvent.StateChanged(ConnectionState.IDLE))
     }
 
     companion object {
-        private const val TAG =
-            "GeminiLiveClient"
-
-        private const val NORMAL_CLOSURE =
-            1000
+        private const val TAG = "GeminiLiveClient"
+        private const val NORMAL_CLOSURE = 1000
     }
 }
