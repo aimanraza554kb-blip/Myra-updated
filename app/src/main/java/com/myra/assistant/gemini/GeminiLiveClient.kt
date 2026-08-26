@@ -81,9 +81,10 @@ class GeminiLiveClient(
         this.config = config
         running.set(true)
         reconnectAttempts = 0
-        // Keep the original working Live model selected by Settings.
-        // Do not auto-discover/switch models here: ListModels can expose preview
-        // models that are not valid for this Live WebSocket/API-version path.
+
+        // Do not auto-select an old model from ListModels. The Gemini Live model
+        // list can contain legacy/deprecated IDs that are no longer usable for
+        // the current Live endpoint. The selected model comes from GeminiModel.
         scope.launch(Dispatchers.IO) {
             openSocket()
         }
@@ -230,9 +231,11 @@ class GeminiLiveClient(
         val chunk = JSONObject()
             .put("mimeType", "audio/pcm;rate=" + Constants.INPUT_SAMPLE_RATE)
             .put("data", b64)
+        // Current Live API uses realtimeInput.audio. The older mediaChunks
+        // field is deprecated and can be rejected by newer Live sessions.
         val message = JSONObject().put(
             "realtimeInput",
-            JSONObject().put("mediaChunks", JSONArray().put(chunk))
+            JSONObject().put("audio", chunk)
         )
         safeSend(message.toString(), "audio")
     }
