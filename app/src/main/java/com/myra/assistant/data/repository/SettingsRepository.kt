@@ -13,11 +13,10 @@ class SettingsRepository(private val prefs: SecurePreferences) {
     fun apiKey(): String = prefs.getString(Constants.KEY_API_KEY, "")
     fun setApiKey(value: String) = prefs.putString(Constants.KEY_API_KEY, value.trim())
 
-    // Keep MYRA on the original working Gemini Live model.
-    // This also prevents an older saved 2.5 native-audio preference from being
-    // selected again after the app is updated.
+    // Default to the current Gemini Live model. Old saved model IDs are mapped
+    // to the current default by GeminiModel.fromId().
     fun model(): GeminiModel = GeminiModel.fromId(
-        prefs.getString(Constants.KEY_MODEL, GeminiModel.FLASH_LIVE_2_0.id)
+        prefs.getString(Constants.KEY_MODEL, GeminiModel.FLASH_3_1_LIVE.id)
     )
     fun setModel(model: GeminiModel) = prefs.putString(Constants.KEY_MODEL, model.id)
 
