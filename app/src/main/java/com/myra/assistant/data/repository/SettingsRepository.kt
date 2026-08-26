@@ -13,11 +13,12 @@ class SettingsRepository(private val prefs: SecurePreferences) {
     fun apiKey(): String = prefs.getString(Constants.KEY_API_KEY, "")
     fun setApiKey(value: String) = prefs.putString(Constants.KEY_API_KEY, value.trim())
 
-    // Default to the native-audio model: it answers speech directly (audio->audio)
-    // instead of transcribing to text first and then replying, which removes the
-    // "detect words, then respond" delay. If a key doesn't have it enabled, the
-    // client automatically falls back to another available Live model.
-    fun model(): GeminiModel = GeminiModel.fromId(prefs.getString(Constants.KEY_MODEL, GeminiModel.FLASH_NATIVE_AUDIO.id))
+    // Keep MYRA on the original working Gemini Live model.
+    // This also prevents an older saved 2.5 native-audio preference from being
+    // selected again after the app is updated.
+    fun model(): GeminiModel = GeminiModel.fromId(
+        prefs.getString(Constants.KEY_MODEL, GeminiModel.FLASH_LIVE_2_0.id)
+    )
     fun setModel(model: GeminiModel) = prefs.putString(Constants.KEY_MODEL, model.id)
 
     fun voice(): VoiceOption = VoiceOption.fromName(prefs.getString(Constants.KEY_VOICE, VoiceOption.AOEDE.voiceName))
