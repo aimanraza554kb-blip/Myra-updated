@@ -1,30 +1,24 @@
 package com.myra.assistant.data.model
 
 /**
- * Supported Gemini Live models. The user can switch between them in Settings.
+ * Supported Gemini Live model.
  *
- * Note: model ids are the values passed to the Live API (prefixed with
- * "models/" by the client). Update these strings if Google changes the
- * preview identifiers.
+ * MYRA uses the same Live model that was working in the original build.
+ * Do not automatically replace this with preview/native-audio model IDs.
  */
 enum class GeminiModel(
     val id: String,
-    val displayName: String,
-    val nativeAudio: Boolean
+    val displayName: String
 ) {
-    FLASH_NATIVE_AUDIO(
-        id = "gemini-2.5-flash-preview-native-audio-dialog",
-        displayName = "Gemini 2.5 Flash (Native Audio)",
-        nativeAudio = true
-    ),
     FLASH_LIVE_2_0(
         id = "gemini-2.0-flash-live-001",
-        displayName = "Gemini 2.0 Flash Live",
-        nativeAudio = false
+        displayName = "Gemini 2.0 Flash Live"
     );
 
     companion object {
         fun fromId(id: String?): GeminiModel =
-            entries.firstOrNull { it.id == id } ?: FLASH_LIVE_2_0
+            // Also handles an old saved preference containing the removed
+            // 2.5 native-audio preview model: always fall back to 2.0 Live.
+            FLASH_LIVE_2_0
     }
 }
