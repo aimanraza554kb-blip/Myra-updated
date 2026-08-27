@@ -25,7 +25,9 @@ class MyraWakeWordListener(
     private var restarting = false
     private var triggered = false
 
-    private val wakePhrases = listOf("hey myra", "hey mira", "hi myra", "myra")
+    private val wakePhrases = listOf(
+        "hey myra", "hey mira", "hey mayra", "hi myra", "hi mira", "myra", "mira", "mayra"
+    )
 
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
     fun start() {
@@ -63,7 +65,7 @@ class MyraWakeWordListener(
     private fun check(results: Bundle?) {
         val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) ?: return
         for (raw in matches) {
-            val normalized = raw.lowercase(Locale.getDefault())
+            val normalized = raw.lowercase(Locale.ENGLISH)
                 .replace(Regex("[^a-z0-9 ]"), " ")
                 .replace(Regex("\\s+"), " ")
                 .trim()
