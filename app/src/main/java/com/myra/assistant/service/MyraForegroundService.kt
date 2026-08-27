@@ -19,31 +19,49 @@ import com.myra.assistant.util.Logger
 import com.myra.assistant.util.PermissionHelper
 
 /**
- * Always-on foreground service that keeps the Gemini Live session alive in the
- * background and hosts the hands-free / continuous-listening loop.
+ * Foreground service that stays alive for hands-free wake-word listening.
+ *
+ * When Wake Word is enabled, Gemini is NOT started until "Hey MYRA" is heard.
+ * The wake recognizer owns the microphone while waiting. Once the wake phrase
+ * is detected it releases the microphone and starts the normal Gemini session.
  */
 class MyraForegroundService : Service() {
+
+    private var wakeWordListener: MyraWakeWordListener? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        // When the Gemini session is stopped from anywhere in the app, return
+        // immediately to wake-word mode if the feature is enabled.
+        ServiceLocator.voiceSessionManager.onSessionStopped = {
+            if (ServiceLocator.settingsRepository.wakeWordEnabled()) {
+                startWakeWordMode()
+            }
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            ServiceLocator.init(applicationContext)
-            ServiceLocator.voiceSessionManager.stop()
-            return START_STICKY
-        }
         startAsForeground()
-        // On Android 14+ a microphone FGS crashes if the permission is missing.
-        // Fail safe: stop cleanly and let the UI surface the missing permission.
+
         if (!PermissionHelper.hasPermission(this, Manifest.permission.RECORD_AUDIO)) {
             Logger.w(TAG, "Microphone permission missing; stopping foreground service")
             stopSelf()
             return START_NOT_STICKY
         }
-        if (PermissionHelper.hasPermission(this, Manifest.permission.RECORD_AUDIO)) {
-            ServiceLocator.voiceSessionManager.startWakeWord()
+
+        if (ServiceLocator.settingsRepository.wakeWordEnabled()) {
+            // Wake mode is independent of Gemini's active state.
+            if (!ServiceLocator.voiceSessionManager.active.value) {
+                startWakeWordMode()
+            }
+        } else {
+            // Preserve the existing behavior when wake word is disabled.
+            ServiceLocator.voiceSessionManager.start()
         }
-        Logger.i(TAG, "Foreground service started; wake word listener ready")
+
+        Logger.i(TAG, "Foreground service started")
         return START_STICKY
     }
 
@@ -63,9 +81,14 @@ class MyraForegroundService : Service() {
 
     private fun buildNotification(): Notification {
         val openIntent = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java),
+            this,
+            0,
+            Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
+
+        // Deliberately no Start/Stop action here: with Wake Word enabled the
+        // service must remain alive so "Hey MYRA" can wake Gemini while MYRA is idle.
         return NotificationCompat.Builder(this, Constants.CHANNEL_FOREGROUND)
             .setContentTitle(getString(R.string.fgs_notification_title))
             .setContentText(getString(R.string.fgs_notification_text))
@@ -77,15 +100,41 @@ class MyraForegroundService : Service() {
             .build()
     }
 
+    private fun startWakeWordMode() {
+        if (!ServiceLocator.settingsRepository.wakeWordEnabled()) return
+        if (ServiceLocator.voiceSessionManager.active.value) return
+        if (wakeWordListener != null) return
+
+        wakeWordListener = MyraWakeWordListener(
+            context = this,
+            languageTag = ServiceLocator.settingsRepository.language(),
+            onWakeWord = {
+                // Release the microphone before Gemini's AudioRecorder starts.
+                wakeWordListener?.stop()
+                wakeWordListener = null
+
+                Logger.i(TAG, "Wake word detected; starting MYRA immediately")
+
+                // No TTS acknowledgement and no artificial delay. Gemini starts
+                // immediately after the wake recognizer releases the microphone.
+                android.os.Handler(mainLooper).post {
+                    ServiceLocator.voiceSessionManager.start()
+                }
+            }
+        ).also { it.start() }
+    }
+
     override fun onDestroy() {
-        ServiceLocator.voiceSessionManager.shutdown()
+        wakeWordListener?.stop()
+        wakeWordListener = null
+        ServiceLocator.voiceSessionManager.onSessionStopped = null
+        ServiceLocator.voiceSessionManager.stop()
         Logger.i(TAG, "Foreground service destroyed")
         super.onDestroy()
     }
 
     companion object {
         private const val TAG = "MyraForeground"
-        const val ACTION_STOP = "com.myra.assistant.STOP"
 
         fun start(context: Context) {
             val intent = Intent(context, MyraForegroundService::class.java)
@@ -97,8 +146,10 @@ class MyraForegroundService : Service() {
         }
 
         fun stop(context: Context) {
-            context.startService(
-                Intent(context, MyraForegroundService::class.java).setAction(ACTION_STOP)
+            // Kept for compatibility with existing callers. The wake-word UI no
+            // longer exposes a Start/Stop control when Wake Word is enabled.
+            context.stopService(
+                Intent(context, MyraForegroundService::class.java)
             )
         }
     }
