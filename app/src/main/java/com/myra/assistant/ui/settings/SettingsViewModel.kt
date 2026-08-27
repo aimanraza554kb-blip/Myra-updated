@@ -49,10 +49,11 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
         settings.setWakeWordEnabled(value)
         val context = getApplication<Application>()
         if (value) {
-            // Wake-word listening must exist even while Gemini is idle.
+            // Start the foreground service in wake-only mode. Gemini stays idle
+            // until the wake phrase is detected or the user presses Start.
             MyraForegroundService.start(context)
-        } else {
-            // Disable wake listening without changing the stored Gemini/API settings.
+        } else if (!ServiceLocator.voiceSessionManager.active.value) {
+            // Stop the wake-only service when Gemini is not manually running.
             MyraForegroundService.stop(context)
         }
     }
