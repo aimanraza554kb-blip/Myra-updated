@@ -46,7 +46,6 @@ fun HomeScreen(
     val output by viewModel.outputTranscript.collectAsStateWithLifecycle()
     val micMuted by viewModel.micMuted.collectAsStateWithLifecycle()
     val playbackMuted by viewModel.playbackMuted.collectAsStateWithLifecycle()
-    val active by viewModel.active.collectAsStateWithLifecycle()
     val lastError by viewModel.lastError.collectAsStateWithLifecycle()
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -130,7 +129,7 @@ fun HomeScreen(
 }
 
 private fun statusText(state: ConnectionState): String = when (state) {
-    ConnectionState.IDLE -> "Say Hey MYRA to wake me"
+    ConnectionState.IDLE -> "Say Hey MYRA to wake"
     ConnectionState.CONNECTING -> "Connecting..."
     ConnectionState.CONNECTED -> "Connected"
     ConnectionState.LISTENING -> "Listening..."
