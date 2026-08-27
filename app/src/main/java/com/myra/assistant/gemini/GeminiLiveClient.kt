@@ -43,6 +43,15 @@ class GeminiLiveClient(
     private var reconnectAttempts = 0
     private var renewJob: Job? = null
 
+    // Keep a small rolling conversation history locally so a planned Live-session
+    // renewal/reconnect does not make MYRA forget the current conversation.
+    // Only completed text turns are stored; raw audio is never persisted.
+    private data class HistoryTurn(val role: String, val text: String)
+    private val history = ArrayDeque<HistoryTurn>()
+    private var pendingUserText = StringBuilder()
+    private var pendingModelText = StringBuilder()
+    private val historyLock = Any()
+
     // True ONLY between receiving setupComplete and the socket closing. Every
     // realtimeInput / clientContent / toolResponse must wait for this. Sending
     // anything before the setup handshake finishes makes the Live API close the
@@ -81,12 +90,59 @@ class GeminiLiveClient(
         this.config = config
         running.set(true)
         reconnectAttempts = 0
-
-        // Do not auto-select an old model from ListModels. The Gemini Live model
-        // list can contain legacy/deprecated IDs that are no longer usable for
-        // the current Live endpoint. The selected model comes from GeminiModel.
+        // Model discovery + socket open both do blocking network I/O, so keep
+        // them off the Default (CPU) dispatcher to avoid stalling other work.
         scope.launch(Dispatchers.IO) {
+            resolveWorkingModel(config)
             openSocket()
+        }
+    }
+
+    /**
+     * Query the REST ListModels endpoint so we connect with a model this API key
+     * actually supports for bidiGenerateContent (the Live API). Different keys and
+     * projects expose different Live models, so we auto-pick a working one instead
+     * of hard-coding a name that may be unavailable for the user.
+     */
+    private fun resolveWorkingModel(cfg: GeminiConfig) {
+        if (cfg.apiKey.isBlank()) return
+        // Skip the ListModels round-trip if we already resolved a good model for
+        // this key earlier in the process - makes reconnects/renewals faster.
+        modelCache[cfg.apiKey]?.let { cached ->
+            if (cfg.model != cached) config = cfg.copy(model = cached)
+            return
+        }
+        try {
+            val req = Request.Builder()
+                .url("https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000&key=" + cfg.apiKey)
+                .build()
+            http.newCall(req).execute().use { resp ->
+                val body = resp.body?.string() ?: return
+                val models = JSONObject(body).optJSONArray("models") ?: return
+                val bidi = ArrayList<String>()
+                for (i in 0 until models.length()) {
+                    val m = models.getJSONObject(i)
+                    val methods = m.optJSONArray("supportedGenerationMethods") ?: continue
+                    for (j in 0 until methods.length()) {
+                        if (methods.getString(j).equals("bidiGenerateContent", true)) {
+                            bidi.add(m.getString("name").removePrefix("models/"))
+                        }
+                    }
+                }
+                Logger.i(TAG, "Live-capable models for this key: $bidi")
+                if (bidi.isEmpty()) {
+                    onEvent(GeminiEvent.Error("This API key has no Live (bidiGenerateContent) models enabled."))
+                    return
+                }
+                val chosen = if (bidi.any { it == cfg.model }) cfg.model else bidi.first()
+                if (chosen != cfg.model) {
+                    config = cfg.copy(model = chosen)
+                    Logger.i(TAG, "Model ${cfg.model} unavailable; switching to $chosen")
+                }
+                modelCache[cfg.apiKey] = chosen
+            }
+        } catch (e: Exception) {
+            Logger.e(TAG, "Model resolution failed", e)
         }
     }
 
@@ -231,11 +287,9 @@ class GeminiLiveClient(
         val chunk = JSONObject()
             .put("mimeType", "audio/pcm;rate=" + Constants.INPUT_SAMPLE_RATE)
             .put("data", b64)
-        // Current Live API uses realtimeInput.audio. The older mediaChunks
-        // field is deprecated and can be rejected by newer Live sessions.
         val message = JSONObject().put(
             "realtimeInput",
-            JSONObject().put("audio", chunk)
+            JSONObject().put("mediaChunks", JSONArray().put(chunk))
         )
         safeSend(message.toString(), "audio")
     }
@@ -251,7 +305,11 @@ class GeminiLiveClient(
             "clientContent",
             JSONObject().put("turns", JSONArray().put(turn)).put("turnComplete", true)
         )
-        safeSend(message.toString(), "text")
+        if (safeSend(message.toString(), "text")) {
+            synchronized(historyLock) {
+                pendingUserText.append(text)
+            }
+        }
     }
 
     /** Send function-call results back to the model so it can finish the turn. */
@@ -278,6 +336,7 @@ class GeminiLiveClient(
             if (obj.has("setupComplete")) {
                 // Handshake done: it is now safe to stream audio and tool results.
                 sessionReady.set(true)
+                restoreConversationHistory()
                 onEvent(GeminiEvent.SetupComplete)
                 return
             }
@@ -303,9 +362,15 @@ class GeminiLiveClient(
                 val sc = obj.getJSONObject("serverContent")
                 if (sc.optBoolean("interrupted", false)) onEvent(GeminiEvent.Interrupted)
                 sc.optJSONObject("inputTranscription")?.optString("text")?.takeIf { it.isNotEmpty() }
-                    ?.let { onEvent(GeminiEvent.InputTranscript(it)) }
+                    ?.let {
+                        synchronized(historyLock) { pendingUserText.append(it) }
+                        onEvent(GeminiEvent.InputTranscript(it))
+                    }
                 sc.optJSONObject("outputTranscription")?.optString("text")?.takeIf { it.isNotEmpty() }
-                    ?.let { onEvent(GeminiEvent.OutputTranscript(it)) }
+                    ?.let {
+                        synchronized(historyLock) { pendingModelText.append(it) }
+                        onEvent(GeminiEvent.OutputTranscript(it))
+                    }
                 sc.optJSONObject("modelTurn")?.optJSONArray("parts")?.let { parts ->
                     for (i in 0 until parts.length()) {
                         val part = parts.getJSONObject(i)
@@ -322,11 +387,51 @@ class GeminiLiveClient(
                         // transcript on screen.
                     }
                 }
-                if (sc.optBoolean("turnComplete", false)) onEvent(GeminiEvent.TurnComplete)
+                if (sc.optBoolean("turnComplete", false)) {
+                    commitPendingTurn()
+                    onEvent(GeminiEvent.TurnComplete)
+                }
             }
         } catch (e: Exception) {
             Logger.e(TAG, "Failed to parse message", e)
         }
+    }
+
+    /** Save every completed turn for the lifetime of this MYRA session. */
+    private fun commitPendingTurn() {
+        synchronized(historyLock) {
+            val user = pendingUserText.toString().trim()
+            val model = pendingModelText.toString().trim()
+            if (user.isNotEmpty()) history.addLast(HistoryTurn("user", user))
+            if (model.isNotEmpty()) history.addLast(HistoryTurn("model", model))
+            pendingUserText = StringBuilder()
+            pendingModelText = StringBuilder()
+        }
+    }
+
+    /** Rehydrate the new Live session with the complete current-session conversation. */
+    private fun restoreConversationHistory() {
+        val turns = synchronized(historyLock) { history.toList() }
+        if (turns.isEmpty() || !sessionReady.get()) return
+
+        val arr = JSONArray()
+        turns.forEach { turn ->
+            if (turn.text.isNotBlank()) {
+                arr.put(
+                    JSONObject()
+                        .put("role", turn.role)
+                        .put("parts", JSONArray().put(JSONObject().put("text", turn.text)))
+                )
+            }
+        }
+        if (arr.length() == 0) return
+
+        val message = JSONObject().put(
+            "clientContent",
+            JSONObject().put("turns", arr).put("turnComplete", true)
+        )
+        safeSend(message.toString(), "history")
+        Logger.i(TAG, "Restored complete current-session history: ${turns.size} turns after reconnect")
     }
 
     private fun reconnect(immediate: Boolean = false) {
@@ -367,5 +472,8 @@ class GeminiLiveClient(
     companion object {
         private const val TAG = "GeminiLiveClient"
         private const val NORMAL_CLOSURE = 1000
+        // Per-API-key cache of a known Live-capable model, shared across sessions
+        // in this process so we only run model discovery once.
+        private val modelCache = java.util.concurrent.ConcurrentHashMap<String, String>()
     }
 }
