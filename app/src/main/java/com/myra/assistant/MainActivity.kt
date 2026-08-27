@@ -12,18 +12,26 @@ import androidx.compose.ui.Modifier
 import com.myra.assistant.ui.MyraNavHost
 import com.myra.assistant.ui.theme.MyraTheme
 import com.myra.assistant.util.PermissionHelper
+import com.myra.assistant.service.MyraForegroundService
 
 /** Single-activity host for the whole Compose UI. */
 class MainActivity : ComponentActivity() {
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { /* results handled reactively by feature code */ }
+    ) {
+        if (PermissionHelper.hasPermission(this, android.Manifest.permission.RECORD_AUDIO)) {
+            MyraForegroundService.start(this)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         requestCorePermissions()
+        if (PermissionHelper.hasPermission(this, android.Manifest.permission.RECORD_AUDIO)) {
+            MyraForegroundService.start(this)
+        }
         setContent {
             MyraTheme {
                 Surface(
