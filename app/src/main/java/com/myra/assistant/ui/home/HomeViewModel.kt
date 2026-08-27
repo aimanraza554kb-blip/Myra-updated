@@ -21,7 +21,6 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     val amplitude: StateFlow<Float> = session.amplitude
     val micMuted: StateFlow<Boolean> = session.micMuted
     val playbackMuted: StateFlow<Boolean> = session.playbackMuted
-    val active: StateFlow<Boolean> = session.active
     val lastError: StateFlow<String> = session.lastError
 
     val messages: StateFlow<List<ChatMessage>> =
