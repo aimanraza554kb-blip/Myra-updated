@@ -1,3 +1,4 @@
+
 package com.myra.assistant.ui.home
 
 import android.app.Application
@@ -6,7 +7,6 @@ import androidx.lifecycle.viewModelScope
 import com.myra.assistant.data.ServiceLocator
 import com.myra.assistant.data.model.ChatMessage
 import com.myra.assistant.data.model.ConnectionState
-import com.myra.assistant.service.MyraForegroundService
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.stateIn
@@ -28,16 +28,6 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     val messages: StateFlow<List<ChatMessage>> =
         ServiceLocator.conversationRepository.observeMessages()
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
-
-    fun toggleSession() {
-        val context = getApplication<Application>()
-        if (active.value) {
-            MyraForegroundService.stop(context)
-            session.stop()
-        } else {
-            MyraForegroundService.start(context)
-        }
-    }
 
     fun toggleMic() = session.toggleMic()
     fun togglePlayback() = session.togglePlayback()
