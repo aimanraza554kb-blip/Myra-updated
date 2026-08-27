@@ -23,6 +23,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 
 /**
  * The heart of MYRA. Wires the microphone, Gemini Live client, speaker and VAD
@@ -90,8 +91,27 @@ class VoiceSessionManager(
                 userProfile = profile,
                 customAddon = settings.customPersonality()
             )
+            // Read the key immediately before building the Live config. When the
+            // foreground service wakes MYRA, Android may still be finishing the
+            // settings write/process initialization. Retry briefly instead of
+            // passing a transient blank key to Gemini.
+            var apiKey = settings.apiKey().trim()
+            var keyAttempts = 0
+            while (apiKey.isBlank() && keyAttempts < 5) {
+                delay(250L)
+                apiKey = settings.apiKey().trim()
+                keyAttempts++
+            }
+            if (apiKey.isBlank()) {
+                _active.value = false
+                _lastError.value = "Gemini API key is missing. Add it in Settings."
+                _connectionState.value = ConnectionState.ERROR
+                Logger.e(TAG, "Wake start: API key is blank after retrying")
+                return@launch
+            }
+
             val config = GeminiConfig(
-                apiKey = settings.apiKey(),
+                apiKey = apiKey,
                 model = settings.model().id,
                 voiceName = settings.voice().voiceName,
                 systemInstruction = systemPrompt,
