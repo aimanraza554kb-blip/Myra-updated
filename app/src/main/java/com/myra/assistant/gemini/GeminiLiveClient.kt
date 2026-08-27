@@ -284,12 +284,15 @@ class GeminiLiveClient(
         if (pcm.isEmpty() || pcm.size % 2 != 0) return
         val b64 = Base64.encodeToString(pcm, Base64.NO_WRAP)
         if (b64.isBlank()) return
-        val chunk = JSONObject()
+        // Current Gemini Live WebSocket schema uses realtimeInput.audio directly.
+        // The older realtimeInput.mediaChunks field is deprecated and now causes
+        // server close 1007 (invalid argument).
+        val audio = JSONObject()
             .put("mimeType", "audio/pcm;rate=" + Constants.INPUT_SAMPLE_RATE)
             .put("data", b64)
         val message = JSONObject().put(
             "realtimeInput",
-            JSONObject().put("mediaChunks", JSONArray().put(chunk))
+            JSONObject().put("audio", audio)
         )
         safeSend(message.toString(), "audio")
     }
