@@ -14,9 +14,8 @@ import com.myra.assistant.util.Logger
 import java.util.Locale
 
 /**
- * System speech recognizer used only while waiting for "Hey MYRA".
- * It is deliberately kept separate from Gemini's AudioRecorder so the two
- * components never compete for the microphone.
+ * Lightweight always-ready wake-word listener. It runs only while Gemini is
+ * disconnected, so it never competes with the Gemini microphone recorder.
  */
 class MyraWakeWordListener(
     private val context: Context,
@@ -33,91 +32,52 @@ class MyraWakeWordListener(
         "hey myra",
         "hey mira",
         "hi myra",
+        "hi mira",
         "myra"
     )
 
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
     fun start() {
         if (running || !SpeechRecognizer.isRecognitionAvailable(context)) return
-
         running = true
         triggered = false
-
-        handler.post {
-            createRecognizerAndListen()
-        }
+        handler.post { createRecognizerAndListen() }
     }
 
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
     private fun createRecognizerAndListen() {
         if (!running || triggered) return
 
-        try {
-            recognizer?.destroy()
-        } catch (_: Throwable) {
-        }
-
+        recognizer?.destroy()
         recognizer = SpeechRecognizer.createSpeechRecognizer(context).also {
             it.setRecognitionListener(listener)
         }
 
-        // IMPORTANT:
-        // RecognizerIntent is a utility class. The actual Intent must be
-        // created with Intent(...), not RecognizerIntent(...).
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(
-                RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-                RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
-            )
-
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(
                 RecognizerIntent.EXTRA_LANGUAGE,
-                languageTag.ifBlank {
-                    Locale.getDefault().toLanguageTag()
-                }
+                languageTag.ifBlank { Locale.getDefault().toLanguageTag() }
             )
-
-            putExtra(
-                RecognizerIntent.EXTRA_PARTIAL_RESULTS,
-                true
-            )
-
-            putExtra(
-                RecognizerIntent.EXTRA_MAX_RESULTS,
-                5
-            )
-
-            putExtra(
-                RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
-                900L
-            )
-
-            putExtra(
-                RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
-                600L
-            )
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 350L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 200L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 200L)
         }
 
         try {
             recognizer?.startListening(intent)
         } catch (t: Throwable) {
-            Logger.w(
-                TAG,
-                "Wake recognizer start failed: ${t.message}"
-            )
-            scheduleRestart()
+            Logger.w(TAG, "Wake recognizer start failed: ${t.message}")
+            scheduleRestart(150L)
         }
     }
 
     private fun check(results: Bundle?) {
-        val matches =
-            results?.getStringArrayList(
-                SpeechRecognizer.RESULTS_RECOGNITION
-            ) ?: return
-
+        val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) ?: return
         for (raw in matches) {
-            val normalized = raw
-                .lowercase(Locale.getDefault())
+            val normalized = raw.lowercase(Locale.getDefault())
                 .replace(Regex("[^a-z0-9 ]"), " ")
                 .replace(Regex("\\s+"), " ")
                 .trim()
@@ -131,114 +91,56 @@ class MyraWakeWordListener(
 
     private fun trigger(text: String) {
         if (triggered) return
-
         triggered = true
         running = false
-
-        Logger.i(
-            TAG,
-            "Detected wake phrase: $text"
-        )
-
+        Logger.i(TAG, "Detected wake phrase: $text")
         handler.post {
-            try {
-                recognizer?.cancel()
-            } catch (_: Throwable) {
-            }
-
-            try {
-                recognizer?.destroy()
-            } catch (_: Throwable) {
-            }
-
+            try { recognizer?.cancel() } catch (_: Throwable) {}
+            try { recognizer?.destroy() } catch (_: Throwable) {}
             recognizer = null
-
             onWakeWord()
         }
     }
 
-    private fun scheduleRestart() {
+    private fun scheduleRestart(delayMs: Long = 100L) {
         if (!running || triggered || restarting) return
-
         restarting = true
-
         handler.postDelayed({
             restarting = false
-
-            if (running && !triggered) {
-                createRecognizerAndListen()
-            }
-        }, 350L)
+            if (running && !triggered) createRecognizerAndListen()
+        }, delayMs)
     }
 
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
-    fun restart() {
-        scheduleRestart()
-    }
+    fun restart() = scheduleRestart(100L)
 
     fun stop() {
         running = false
         restarting = false
-
+        triggered = false
         handler.removeCallbacksAndMessages(null)
-
-        try {
-            recognizer?.cancel()
-        } catch (_: Throwable) {
-        }
-
-        try {
-            recognizer?.destroy()
-        } catch (_: Throwable) {
-        }
-
+        try { recognizer?.cancel() } catch (_: Throwable) {}
+        try { recognizer?.destroy() } catch (_: Throwable) {}
         recognizer = null
     }
 
     private val listener = object : RecognitionListener {
-
-        override fun onReadyForSpeech(params: Bundle?) {
-        }
-
-        override fun onBeginningOfSpeech() {
-        }
-
-        override fun onRmsChanged(rmsdB: Float) {
-        }
-
-        override fun onBufferReceived(buffer: ByteArray?) {
-        }
-
-        override fun onEndOfSpeech() {
-            scheduleRestart()
-        }
-
+        override fun onReadyForSpeech(params: Bundle?) {}
+        override fun onBeginningOfSpeech() {}
+        override fun onRmsChanged(rmsdB: Float) {}
+        override fun onBufferReceived(buffer: ByteArray?) {}
+        override fun onEndOfSpeech() { scheduleRestart(50L) }
         override fun onError(error: Int) {
-            Logger.d(
-                TAG,
-                "Wake recognizer error=$error"
-            )
-
-            scheduleRestart()
+            Logger.d(TAG, "Wake recognizer error=$error")
+            scheduleRestart(100L)
         }
-
         override fun onResults(results: Bundle?) {
             check(results)
-            scheduleRestart()
+            if (!triggered) scheduleRestart(50L)
         }
-
-        override fun onPartialResults(partialResults: Bundle?) {
-            check(partialResults)
-        }
-
-        override fun onEvent(
-            eventType: Int,
-            params: Bundle?
-        ) {
-        }
+        override fun onPartialResults(partialResults: Bundle?) { check(partialResults) }
+        override fun onEvent(eventType: Int, params: Bundle?) {}
     }
 
-    companion object {
-        private const val TAG = "MyraWakeWord"
-    }
+    companion object { private const val TAG = "MyraWakeWord" }
 }
