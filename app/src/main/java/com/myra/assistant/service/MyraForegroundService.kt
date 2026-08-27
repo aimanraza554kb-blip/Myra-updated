@@ -118,6 +118,8 @@ class MyraForegroundService : Service() {
                 // No TTS acknowledgement and no artificial delay. Gemini starts
                 // immediately after the wake recognizer releases the microphone.
                 android.os.Handler(mainLooper).post {
+                    // Use the exact same session-start path as manual connection;
+                    // VoiceSessionManager reads the saved API key itself.
                     ServiceLocator.voiceSessionManager.start()
                 }
             }
