@@ -13,11 +13,7 @@ import androidx.annotation.RequiresPermission
 import com.myra.assistant.util.Logger
 import java.util.Locale
 
-/**
- * System speech recognizer used only while waiting for "Hey MYRA".
- * It is deliberately kept separate from Gemini's AudioRecorder so the two
- * components never compete for the microphone.
- */
+/** Lightweight background wake-word listener. It is used only while Gemini is idle. */
 class MyraWakeWordListener(
     private val context: Context,
     private val languageTag: String,
@@ -29,28 +25,19 @@ class MyraWakeWordListener(
     private var restarting = false
     private var triggered = false
 
-    private val wakePhrases = listOf(
-        "hey myra",
-        "hey mira",
-        "hey mayra",
-        "hi myra",
-        "hi mira",
-        "myra",
-        "mira"
-    )
+    private val wakePhrases = listOf("hey myra", "hey mira", "hi myra", "myra")
 
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
     fun start() {
         if (running || !SpeechRecognizer.isRecognitionAvailable(context)) return
         running = true
         triggered = false
-        handler.post { createRecognizerAndListen() }
+        handler.post { listen() }
     }
 
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
-    private fun createRecognizerAndListen() {
+    private fun listen() {
         if (!running || triggered) return
-
         recognizer?.destroy()
         recognizer = SpeechRecognizer.createSpeechRecognizer(context).also {
             it.setRecognitionListener(listener)
@@ -61,10 +48,8 @@ class MyraWakeWordListener(
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, languageTag.ifBlank { Locale.getDefault().toLanguageTag() })
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
-            // Keep recognition windows short so the listener can recover quickly
-            // after silence/errors, while partial results can trigger immediately.
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 700L)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 450L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 500L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 300L)
         }
 
         try {
@@ -82,11 +67,7 @@ class MyraWakeWordListener(
                 .replace(Regex("[^a-z0-9 ]"), " ")
                 .replace(Regex("\\s+"), " ")
                 .trim()
-
-            if (wakePhrases.any { phrase ->
-                    normalized == phrase || normalized.contains(" $phrase ") ||
-                        normalized.startsWith("$phrase ") || normalized.endsWith(" $phrase")
-                }) {
+            if (wakePhrases.any { normalized.contains(it) }) {
                 trigger(raw)
                 return
             }
@@ -97,10 +78,11 @@ class MyraWakeWordListener(
         if (triggered) return
         triggered = true
         running = false
+        handler.removeCallbacksAndMessages(null)
         Logger.i(TAG, "Detected wake phrase: $text")
         handler.post {
             try { recognizer?.cancel() } catch (_: Throwable) {}
-            recognizer?.destroy()
+            try { recognizer?.destroy() } catch (_: Throwable) {}
             recognizer = null
             onWakeWord()
         }
@@ -111,7 +93,7 @@ class MyraWakeWordListener(
         restarting = true
         handler.postDelayed({
             restarting = false
-            if (running && !triggered) createRecognizerAndListen()
+            if (running && !triggered) listen()
         }, 120L)
     }
 
@@ -133,11 +115,8 @@ class MyraWakeWordListener(
         override fun onRmsChanged(rmsdB: Float) {}
         override fun onBufferReceived(buffer: ByteArray?) {}
         override fun onEndOfSpeech() { scheduleRestart() }
-        override fun onError(error: Int) {
-            Logger.d(TAG, "Wake recognizer error=$error")
-            scheduleRestart()
-        }
-        override fun onResults(results: Bundle?) { check(results); scheduleRestart() }
+        override fun onError(error: Int) { Logger.d(TAG, "Wake recognizer error=$error"); scheduleRestart() }
+        override fun onResults(results: Bundle?) { check(results); if (!triggered) scheduleRestart() }
         override fun onPartialResults(partialResults: Bundle?) { check(partialResults) }
         override fun onEvent(eventType: Int, params: Bundle?) {}
     }
