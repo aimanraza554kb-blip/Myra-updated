@@ -15,7 +15,7 @@ class BootReceiver : BroadcastReceiver() {
         if (intent.action == Intent.ACTION_BOOT_COMPLETED) {
             ServiceLocator.init(context)
             val settings = ServiceLocator.settingsRepository
-            if (settings.continuousListening() || settings.handsFree() || settings.wakeWordEnabled()) {
+            if (settings.wakeWordEnabled() || settings.continuousListening() || settings.handsFree()) {
                 MyraForegroundService.start(context)
                 Logger.i(TAG, "Restarted after boot")
             }
