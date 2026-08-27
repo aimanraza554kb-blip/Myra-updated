@@ -1,8 +1,6 @@
 package com.myra.assistant.voice
 
-import android.Manifest
 import android.content.Context
-import androidx.annotation.RequiresPermission
 import com.myra.assistant.audio.AudioPlayer
 import com.myra.assistant.audio.AudioRecorder
 import com.myra.assistant.audio.VoiceActivityDetector
@@ -18,7 +16,6 @@ import com.myra.assistant.gemini.GeminiLiveClient
 import com.myra.assistant.phone.PhoneController
 import com.myra.assistant.phone.PhoneTools
 import com.myra.assistant.util.Logger
-import com.myra.assistant.service.MyraWakeWordListener
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -64,6 +61,10 @@ class VoiceSessionManager(
     val active: StateFlow<Boolean> = _active.asStateFlow()
 
     private val _lastError = MutableStateFlow("")
+
+    /** Called after the Gemini session is explicitly stopped. */
+    @Volatile
+    var onSessionStopped: (() -> Unit)? = null
     val lastError: StateFlow<String> = _lastError.asStateFlow()
 
     private val vad = VoiceActivityDetector()
@@ -71,29 +72,11 @@ class VoiceSessionManager(
     private var recorder: AudioRecorder? = null
     private var player: AudioPlayer? = null
 
-    private val wakeWordListener = MyraWakeWordListener(
-        context = appContext,
-        languageTag = settings.language(),
-        onWakeWord = { start() }
-    )
-
     private val inputBuffer = StringBuilder()
     private val outputBuffer = StringBuilder()
 
-    @RequiresPermission(Manifest.permission.RECORD_AUDIO)
-    fun startWakeWord() {
-        if (_active.value) return
-        wakeWordListener.start()
-        _connectionState.value = ConnectionState.IDLE
-    }
-
-    fun stopWakeWord() {
-        wakeWordListener.stop()
-    }
-
     fun start() {
         if (_active.value) return
-        wakeWordListener.stop()
         _active.value = true
         scope.launch {
             val personality = settings.personality()
@@ -121,6 +104,11 @@ class VoiceSessionManager(
 
             val geminiClient = GeminiLiveClient(scope, ::onEvent)
             client = geminiClient
+
+            // Load the whole address book once, up front, so name -> number
+            // lookups during the session are instant and reliable.
+            runCatching { phoneController.preloadContacts() }
+                .onSuccess { Logger.i(TAG, "Preloaded $it contacts") }
 
             val micRecorder = AudioRecorder(
                 onChunk = { pcm ->
@@ -256,29 +244,7 @@ class VoiceSessionManager(
         _outputTranscript.value = ""
         _connectionState.value = ConnectionState.IDLE
         _amplitude.value = 0f
-
-        // Gemini is now off, but the foreground service remains alive so
-        // "Hey MYRA" can wake it again without a Start button.
-        if (com.myra.assistant.util.PermissionHelper.hasPermission(
-                appContext, Manifest.permission.RECORD_AUDIO
-            )
-        ) {
-            startWakeWord()
-        }
-    }
-
-    fun shutdown() {
-        wakeWordListener.stop()
-        _active.value = false
-        recorder?.stop(); recorder = null
-        player?.stop(); player = null
-        client?.close(); client = null
-        inputBuffer.setLength(0)
-        outputBuffer.setLength(0)
-        _inputTranscript.value = ""
-        _outputTranscript.value = ""
-        _connectionState.value = ConnectionState.IDLE
-        _amplitude.value = 0f
+        onSessionStopped?.invoke()
     }
 
     companion object { private const val TAG = "VoiceSessionManager" }
