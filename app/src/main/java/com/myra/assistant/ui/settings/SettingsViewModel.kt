@@ -3,8 +3,8 @@ package com.myra.assistant.ui.settings
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import com.myra.assistant.data.ServiceLocator
-import com.myra.assistant.service.MyraForegroundService
 import com.myra.assistant.data.model.GeminiModel
+import com.myra.assistant.service.MyraForegroundService
 import com.myra.assistant.data.model.Personality
 import com.myra.assistant.data.model.VoiceOption
 import com.myra.assistant.util.Logger
@@ -49,8 +49,10 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
         settings.setWakeWordEnabled(value)
         val context = getApplication<Application>()
         if (value) {
+            // Wake-word listening must exist even while Gemini is idle.
             MyraForegroundService.start(context)
-        } else if (!settings.continuousListening() && !settings.handsFree()) {
+        } else {
+            // Disable wake listening without changing the stored Gemini/API settings.
             MyraForegroundService.stop(context)
         }
     }
