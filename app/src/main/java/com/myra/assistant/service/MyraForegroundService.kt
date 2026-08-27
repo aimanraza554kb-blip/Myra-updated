@@ -45,9 +45,20 @@ class MyraForegroundService : Service() {
             return START_NOT_STICKY
         }
 
-        if (ServiceLocator.settingsRepository.wakeWordEnabled()) {
+        val manualStart = intent?.action == ACTION_START_SESSION
+
+        if (manualStart) {
+            // Manual Start always means "start Gemini now", regardless of the
+            // wake-word toggle. The normal session.start() path is untouched.
+            ServiceLocator.voiceSessionManager.start()
+            if (ServiceLocator.settingsRepository.wakeWordEnabled()) {
+                watchSessionState()
+            }
+        } else if (ServiceLocator.settingsRepository.wakeWordEnabled()) {
+            // Wake-word mode: keep only the wake listener alive while Gemini is idle.
             watchSessionState()
         } else {
+            // Existing behavior when wake-word mode is disabled.
             ServiceLocator.voiceSessionManager.start()
         }
 
@@ -108,11 +119,17 @@ class MyraForegroundService : Service() {
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
+        val stopIntent = PendingIntent.getService(
+            this, 1,
+            Intent(this, MyraForegroundService::class.java).setAction(ACTION_STOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
         return NotificationCompat.Builder(this, Constants.CHANNEL_FOREGROUND)
             .setContentTitle(getString(R.string.fgs_notification_title))
             .setContentText(getString(R.string.fgs_notification_text))
             .setSmallIcon(R.drawable.ic_mic)
             .setContentIntent(openIntent)
+            .addAction(0, getString(R.string.action_stop), stopIntent)
             .setOngoing(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
@@ -130,11 +147,22 @@ class MyraForegroundService : Service() {
     companion object {
         private const val TAG = "MyraForeground"
         const val ACTION_STOP = "com.myra.assistant.STOP"
+        const val ACTION_START_SESSION = "com.myra.assistant.START_SESSION"
 
         fun start(context: Context) {
             val intent = Intent(context, MyraForegroundService::class.java)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent)
             else context.startService(intent)
+        }
+
+        fun startSession(context: Context) {
+            val intent = Intent(context, MyraForegroundService::class.java)
+                .setAction(ACTION_START_SESSION)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
         }
 
         fun stop(context: Context) {
