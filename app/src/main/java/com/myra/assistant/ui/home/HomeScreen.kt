@@ -46,6 +46,7 @@ fun HomeScreen(
     val output by viewModel.outputTranscript.collectAsStateWithLifecycle()
     val micMuted by viewModel.micMuted.collectAsStateWithLifecycle()
     val playbackMuted by viewModel.playbackMuted.collectAsStateWithLifecycle()
+    val active by viewModel.active.collectAsStateWithLifecycle()
     val lastError by viewModel.lastError.collectAsStateWithLifecycle()
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -117,6 +118,9 @@ fun HomeScreen(
                         contentDescription = "Toggle mic"
                     )
                 }
+                androidx.compose.material3.Button(onClick = viewModel::toggleSession) {
+                    Text(if (active) "Stop" else "Start MYRA")
+                }
                 IconButton(onClick = viewModel::togglePlayback) {
                     Icon(
                         if (playbackMuted) Icons.Filled.VolumeOff else Icons.Filled.VolumeUp,
@@ -129,7 +133,7 @@ fun HomeScreen(
 }
 
 private fun statusText(state: ConnectionState): String = when (state) {
-    ConnectionState.IDLE -> "Say Hey MYRA to wake"
+    ConnectionState.IDLE -> "Tap Start to talk to MYRA"
     ConnectionState.CONNECTING -> "Connecting..."
     ConnectionState.CONNECTED -> "Connected"
     ConnectionState.LISTENING -> "Listening..."
