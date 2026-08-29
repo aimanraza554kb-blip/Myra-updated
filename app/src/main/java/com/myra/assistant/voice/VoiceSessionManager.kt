@@ -220,7 +220,7 @@ class VoiceSessionManager(
             val responses = event.calls.map { call ->
                 val result = if (call.name == "remember") {
                     val fact = call.args.optString("fact")
-                    if (fact.isNotBlank()) memory.remember(fact)
+                    if (fact.isNotBlank()) memory.remember(fact, pinned = true)
                     "Saved to memory"
                 } else {
                     phoneController.dispatch(call.name, call.args)
