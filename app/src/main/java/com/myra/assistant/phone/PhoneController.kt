@@ -18,6 +18,9 @@ import com.myra.assistant.service.MyraAccessibilityService
 import com.myra.assistant.util.Logger
 import com.myra.assistant.util.PermissionHelper
 import java.util.Locale
+import java.time.ZoneId
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
 import org.json.JSONObject
 
 /**
@@ -470,6 +473,7 @@ class PhoneController(
                         else -> "I couldn't find $to on WhatsApp. Make sure the contact is saved and has WhatsApp."
                     }
                 }
+                "get_current_time" -> currentPakistanTime()
                 "get_weather" -> info.weather(args.optString("location"))
                 "get_distance" -> info.distance(args.optString("from"), args.optString("to"))
                 else -> "Unknown action: $name"
@@ -478,6 +482,13 @@ class PhoneController(
             Logger.e(TAG, "dispatch failed for $name", e)
             "Failed: ${e.message}"
         }
+    }
+
+    private fun currentPakistanTime(): String {
+        val now = ZonedDateTime.now(ZoneId.of("Asia/Karachi"))
+        val date = now.format(DateTimeFormatter.ofPattern("EEEE, dd MMMM yyyy", Locale.ENGLISH))
+        val time = now.format(DateTimeFormatter.ofPattern("hh:mm a", Locale.ENGLISH))
+        return "Pakistan local time: $time, $date (Asia/Karachi)."
     }
 
     /** Extract a durable fact worth remembering (learning mode). */
