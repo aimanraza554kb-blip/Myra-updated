@@ -88,6 +88,7 @@ object PhoneTools {
         decls.put(fn("press_home", "Go to the home screen. Needs the accessibility service."))
         decls.put(fn("open_recents", "Open the recent apps overview. Needs the accessibility service."))
         decls.put(fn("open_notifications", "Open the notification shade. Needs the accessibility service."))
+        decls.put(fn("get_current_time", "Get the exact current local date and time. ALWAYS use this function when the user asks what time/date it is. The result is the phone's current Pakistan local time (Asia/Karachi)."))
         decls.put(fn("get_weather", "Get the current weather. Leave location empty to use the user's current location.",
             obj("location" to str("City or place name (optional)"))))
         decls.put(fn("get_distance", "Get the distance and driving time between two places.",
