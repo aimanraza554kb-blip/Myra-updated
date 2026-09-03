@@ -77,7 +77,18 @@ class VoiceSessionManager(
     private val outputBuffer = StringBuilder()
 
     fun start() {
-        if (_active.value) return
+        if (_active.value) {
+            // The foreground service can survive an Activity/task restart. In that
+            // case the manager may still say "active" while the old Live session
+            // is no longer usable. Rebuild the session instead of silently doing
+            // nothing, which is what caused MYRA to stop responding after reopen.
+            val ready = client?.isSessionReady() == true
+            val audioReady = recorder != null && player != null
+            if (ready && audioReady) return
+
+            Logger.w(TAG, "Active session is stale; restarting Gemini/audio resources")
+            stop()
+        }
         _active.value = true
         scope.launch {
             val personality = settings.personality()
@@ -145,6 +156,11 @@ class VoiceSessionManager(
 
             geminiClient.connect(config)
         }
+    }
+
+    /** Ensure the existing foreground-service session is actually usable. */
+    fun ensureStarted() {
+        start()
     }
 
     private fun onEvent(event: GeminiEvent) {
