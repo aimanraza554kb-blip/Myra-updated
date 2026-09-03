@@ -270,11 +270,13 @@ class GeminiLiveClient(
                 "automaticActivityDetection",
                 JSONObject()
                     .put("disabled", false)
-                    .put("prefixPaddingMs", 10)
-                    // Practically the floor: commit end-of-turn after ~2 silent
-                    // 20ms frames so MYRA starts replying almost instantly. Going
-                    // lower risks cutting the user off during natural pauses.
-                    .put("silenceDurationMs", 40)
+                    .put("prefixPaddingMs", 50)
+                    // Do not end a turn on tiny natural pauses. MYRA streams 20ms
+                    // microphone frames, so 40ms was effectively ending many
+                    // utterances while the user was still speaking. Google's current
+                    // Live API guidance recommends roughly 500-800ms for a good
+                    // balance between reliable turn detection and response latency.
+                    .put("silenceDurationMs", 650)
             )
         )
 
