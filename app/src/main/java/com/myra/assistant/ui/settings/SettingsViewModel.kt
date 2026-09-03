@@ -18,16 +18,28 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
     fun setApiKey(value: String) = settings.setApiKey(value)
 
     fun model() = settings.model()
-    fun setModel(model: GeminiModel) = settings.setModel(model)
+    fun setModel(model: GeminiModel) {
+        settings.setModel(model)
+        ServiceLocator.voiceSessionManager.restart()
+    }
 
     fun voice() = settings.voice()
-    fun setVoice(voice: VoiceOption) = settings.setVoice(voice)
+    fun setVoice(voice: VoiceOption) {
+        settings.setVoice(voice)
+        ServiceLocator.voiceSessionManager.restart()
+    }
 
     fun personality() = settings.personality()
-    fun setPersonality(p: Personality) = settings.setPersonality(p)
+    fun setPersonality(p: Personality) {
+        settings.setPersonality(p)
+        ServiceLocator.voiceSessionManager.restart()
+    }
 
     fun language() = settings.language()
-    fun setLanguage(value: String) = settings.setLanguage(value)
+    fun setLanguage(value: String) {
+        settings.setLanguage(value)
+        ServiceLocator.voiceSessionManager.restart()
+    }
 
     fun userName() = settings.userName()
     fun setUserName(value: String) = settings.setUserName(value)
