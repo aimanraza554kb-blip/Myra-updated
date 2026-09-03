@@ -220,7 +220,10 @@ class GeminiLiveClient(
             }
             Logger.e(TAG, "WebSocket failure: $detail", t)
             onEvent(GeminiEvent.Error(detail))
-            if (running.get()) reconnect()
+            // Do not hammer the API after a quota/rate-limit rejection. Gemini
+            // rate limits are project-level, so reconnecting with the same key
+            // cannot recover from a 429 and can make the situation worse.
+            if (running.get() && !isQuotaOrRateLimit(detail)) reconnect()
         }
     }
 
@@ -276,13 +279,10 @@ class GeminiLiveClient(
                 "automaticActivityDetection",
                 JSONObject()
                     .put("disabled", false)
-                    .put("prefixPaddingMs", 50)
-                    // Do not end a turn on tiny natural pauses. MYRA streams 20ms
-                    // microphone frames, so 40ms was effectively ending many
-                    // utterances while the user was still speaking. Google's current
-                    // Live API guidance recommends roughly 500-800ms for a good
-                    // balance between reliable turn detection and response latency.
-                    .put("silenceDurationMs", 650)
+                    .put("prefixPaddingMs", 10)
+                    // Keep the same low-latency setting used by the original working build.
+                    // The user expects MYRA to answer immediately after speaking.
+                    .put("silenceDurationMs", 40)
             )
         )
 
@@ -382,6 +382,17 @@ class GeminiLiveClient(
     private fun handleMessage(raw: String) {
         try {
             val obj = JSONObject(raw)
+            if (obj.has("error")) {
+                val err = obj.optJSONObject("error")
+                val status = err?.optString("status").orEmpty()
+                val message = err?.optString("message").orEmpty()
+                val detail = listOf(status, message).filter { it.isNotBlank() }.joinToString(": ")
+                    .ifBlank { "Gemini Live API error" }
+                Logger.e(TAG, "Server error: $detail")
+                onEvent(GeminiEvent.Error(detail))
+                if (isQuotaOrRateLimit(detail)) running.set(false)
+                return
+            }
             if (obj.has("setupComplete")) {
                 // Handshake done: it is now safe to stream audio and tool results.
                 sessionReady.set(true)
@@ -481,6 +492,15 @@ class GeminiLiveClient(
         )
         safeSend(message.toString(), "history")
         Logger.i(TAG, "Restored complete current-session history: ${turns.size} turns after reconnect")
+    }
+
+    private fun isQuotaOrRateLimit(detail: String): Boolean {
+        val text = detail.lowercase()
+        return text.contains("quota") ||
+            text.contains("rate limit") ||
+            text.contains("resource_exhausted") ||
+            text.contains("too many requests") ||
+            text.contains("429")
     }
 
     private fun reconnect(immediate: Boolean = false) {
