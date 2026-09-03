@@ -163,6 +163,14 @@ class VoiceSessionManager(
         start()
     }
 
+    /** Restart the Live session so changed settings are applied immediately. */
+    fun restart() {
+        if (!_active.value) return
+        Logger.i(TAG, "Restarting session to apply changed settings")
+        stop(notifyStopped = false)
+        start()
+    }
+
     private fun onEvent(event: GeminiEvent) {
         when (event) {
             is GeminiEvent.Connected -> {
@@ -269,7 +277,7 @@ class VoiceSessionManager(
     /** Interrupt MYRA while she is speaking. */
     fun interrupt() = player?.flush()
 
-    fun stop() {
+    fun stop(notifyStopped: Boolean = true) {
         _active.value = false
         recorder?.stop(); recorder = null
         player?.stop(); player = null
@@ -280,7 +288,7 @@ class VoiceSessionManager(
         _outputTranscript.value = ""
         _connectionState.value = ConnectionState.IDLE
         _amplitude.value = 0f
-        onSessionStopped?.invoke()
+        if (notifyStopped) onSessionStopped?.invoke()
     }
 
     companion object { private const val TAG = "VoiceSessionManager" }
