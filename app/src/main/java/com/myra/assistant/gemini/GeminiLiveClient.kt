@@ -23,16 +23,12 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * WebSocket client for the Gemini Live API (BidiGenerateContent).
  *
- * Handles:
- * - Live WebSocket connection
- * - Setup handshake
- * - Streaming PCM microphone audio
- * - Streaming PCM audio responses
- * - Input/output transcription
- * - Function calling
- * - Automatic reconnect
- * - Session renewal
- * - Keepalive
+ * Supports both:
+ * - Gemini 2.5 Flash Live
+ * - Gemini 3.1 Flash Live
+ *
+ * The existing 2.5 behavior is preserved.
+ * Gemini 3.1 uses its newer realtime text/history behavior.
  */
 class GeminiLiveClient(
     private val scope: CoroutineScope,
@@ -57,27 +53,50 @@ class GeminiLiveClient(
     private var reconnectAttempts = 0
     private var renewJob: Job? = null
 
-    /**
-     * TRUE only after Gemini sends setupComplete.
+    /*
+     * Rolling conversation history.
      *
-     * Audio/text/tool responses must not be sent before setupComplete.
+     * Raw audio is never persisted.
+     */
+    private data class HistoryTurn(
+        val role: String,
+        val text: String
+    )
+
+    private val history = ArrayDeque<HistoryTurn>()
+
+    private var pendingUserText = StringBuilder()
+    private var pendingModelText = StringBuilder()
+
+    private val historyLock = Any()
+
+    /*
+     * TRUE only after setupComplete.
+     *
+     * No realtime audio/text/toolResponse is sent before this.
      */
     private val sessionReady = AtomicBoolean(false)
 
-    /**
-     * Prevents duplicate WebSocket connection attempts.
+    /*
+     * Prevent overlapping connections.
      */
     private val connecting = AtomicBoolean(false)
 
-    /**
-     * Used for useful diagnostics if Gemini closes the socket.
-     */
     @Volatile
     private var lastOutgoingLabel: String = "none"
 
 
     /**
-     * Safely sends a WebSocket message.
+     * Gemini 3.1 model ID.
+     */
+    private fun isGemini31(): Boolean {
+        return config?.model ==
+                "gemini-3.1-flash-live-preview"
+    }
+
+
+    /**
+     * Single outgoing-message choke point.
      */
     private fun safeSend(
         message: String,
@@ -99,11 +118,14 @@ class GeminiLiveClient(
             val queued = ws.send(message)
 
             if (!queued) {
+
                 Logger.w(
                     TAG,
                     "Drop '$label': send buffer full or socket closing"
                 )
+
             } else if (label != "audio") {
+
                 Logger.d(
                     TAG,
                     "-> $label (${message.length} bytes)"
@@ -126,12 +148,9 @@ class GeminiLiveClient(
 
 
     /**
-     * Starts Gemini Live connection.
+     * Start Live connection.
      *
-     * IMPORTANT:
-     * We intentionally DO NOT call Google's ListModels endpoint here.
-     *
-     * The model selected in MYRA Settings is used directly.
+     * Keep the original model-discovery behavior so 2.5 remains compatible.
      */
     fun connect(config: GeminiConfig) {
 
@@ -142,17 +161,177 @@ class GeminiLiveClient(
         reconnectAttempts = 0
 
         scope.launch(Dispatchers.IO) {
+
+            resolveWorkingModel(config)
+
             openSocket()
         }
     }
 
 
     /**
-     * Opens a brand-new WebSocket session.
+     * Resolve a Live-capable model for the API key.
+     *
+     * This is intentionally retained from the previously working version.
+     */
+    private fun resolveWorkingModel(
+        cfg: GeminiConfig
+    ) {
+
+        if (cfg.apiKey.isBlank()) {
+            return
+        }
+
+        modelCache[cfg.apiKey]?.let { cached ->
+
+            if (cfg.model != cached) {
+
+                config =
+                    cfg.copy(
+                        model = cached
+                    )
+            }
+
+            return
+        }
+
+        try {
+
+            val req =
+                Request.Builder()
+                    .url(
+                        "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000&key=" +
+                                cfg.apiKey
+                    )
+                    .build()
+
+            http.newCall(req)
+                .execute()
+                .use { resp ->
+
+                    val body =
+                        resp.body?.string()
+                            ?: return
+
+                    val models =
+                        JSONObject(body)
+                            .optJSONArray("models")
+                            ?: return
+
+                    val bidi =
+                        ArrayList<String>()
+
+                    for (
+                        i in 0 until models.length()
+                    ) {
+
+                        val model =
+                            models.getJSONObject(i)
+
+                        val methods =
+                            model.optJSONArray(
+                                "supportedGenerationMethods"
+                            )
+                            ?: continue
+
+                        for (
+                            j in 0 until methods.length()
+                        ) {
+
+                            if (
+                                methods
+                                    .getString(j)
+                                    .equals(
+                                        "bidiGenerateContent",
+                                        true
+                                    )
+                            ) {
+
+                                bidi.add(
+                                    model
+                                        .getString("name")
+                                        .removePrefix(
+                                            "models/"
+                                        )
+                                )
+                            }
+                        }
+                    }
+
+                    Logger.i(
+                        TAG,
+                        "Live-capable models for this key: $bidi"
+                    )
+
+                    if (bidi.isEmpty()) {
+
+                        onEvent(
+                            GeminiEvent.Error(
+                                "This API key has no Live (bidiGenerateContent) models enabled."
+                            )
+                        )
+
+                        return
+                    }
+
+                    /*
+                     * Prefer exactly what the user selected.
+                     */
+                    val chosen =
+                        if (
+                            bidi.any {
+                                it == cfg.model
+                            }
+                        ) {
+
+                            cfg.model
+
+                        } else {
+
+                            bidi.first()
+                        }
+
+                    if (
+                        chosen != cfg.model
+                    ) {
+
+                        config =
+                            cfg.copy(
+                                model = chosen
+                            )
+
+                        Logger.i(
+                            TAG,
+                            "Model ${cfg.model} unavailable; switching to $chosen"
+                        )
+                    }
+
+                    modelCache[
+                        cfg.apiKey
+                    ] = chosen
+                }
+
+        } catch (e: Exception) {
+
+            /*
+             * If ListModels fails, retain the user's selected model.
+             */
+            Logger.e(
+                TAG,
+                "Model resolution failed",
+                e
+            )
+        }
+    }
+
+
+    /**
+     * Open WebSocket.
      */
     private fun openSocket() {
 
-        val cfg = config ?: return
+        val cfg =
+            config ?: return
 
         if (cfg.apiKey.isBlank()) {
 
@@ -165,23 +344,28 @@ class GeminiLiveClient(
             return
         }
 
-        if (!connecting.compareAndSet(false, true)) {
+        if (
+            !connecting.compareAndSet(
+                false,
+                true
+            )
+        ) {
 
             Logger.w(
                 TAG,
-                "openSocket ignored: connection already in progress"
+                "openSocket ignored: a connection attempt is already in progress"
             )
 
             return
         }
 
-        /**
-         * New session means audio must wait until setupComplete.
+        /*
+         * New session = not ready until setupComplete.
          */
         sessionReady.set(false)
 
-        /**
-         * Fully discard old socket.
+        /*
+         * Discard stale socket.
          */
         webSocket?.let { old ->
 
@@ -218,7 +402,7 @@ class GeminiLiveClient(
 
 
     /**
-     * WebSocket listener.
+     * WebSocket callbacks.
      */
     private val listener =
         object : WebSocketListener() {
@@ -237,8 +421,8 @@ class GeminiLiveClient(
 
                 reconnectAttempts = 0
 
-                /**
-                 * Setup MUST be the first application frame.
+                /*
+                 * Setup must be first application frame.
                  */
                 sendSetup(ws)
 
@@ -277,10 +461,12 @@ class GeminiLiveClient(
             ) {
 
                 try {
+
                     ws.close(
                         NORMAL_CLOSURE,
                         null
                     )
+
                 } catch (_: Exception) {
                 }
             }
@@ -356,7 +542,9 @@ class GeminiLiveClient(
                             append(
                                 " (HTTP "
                             )
-                                .append(r.code)
+                                .append(
+                                    r.code
+                                )
                                 .append(")")
 
                             try {
@@ -390,6 +578,7 @@ class GeminiLiveClient(
                 )
 
                 if (running.get()) {
+
                     reconnect()
                 }
             }
@@ -397,13 +586,14 @@ class GeminiLiveClient(
 
 
     /**
-     * Sends the Gemini Live setup handshake.
+     * Send Gemini Live setup.
      */
     private fun sendSetup(
         ws: WebSocket
     ) {
 
-        val cfg = config ?: return
+        val cfg =
+            config ?: return
 
         val speechConfig =
             JSONObject()
@@ -432,6 +622,9 @@ class GeminiLiveClient(
                     speechConfig
                 )
 
+        /*
+         * Base setup.
+         */
         val setup =
             JSONObject()
                 .put(
@@ -465,29 +658,77 @@ class GeminiLiveClient(
                     "outputAudioTranscription",
                     JSONObject()
                 )
+
+
+        /*
+         * Gemini 3.1:
+         *
+         * clientContent is only supported for initial history seeding.
+         * Therefore explicitly enable initialHistoryInClientContent.
+         */
+        if (cfg.model ==
+            "gemini-3.1-flash-live-preview"
+        ) {
+
+            setup.put(
+                "historyConfig",
+                JSONObject()
+                    .put(
+                        "initialHistoryInClientContent",
+                        true
+                    )
+            )
+
+            /*
+             * 3.1 defaults to minimal thinking.
+             *
+             * Explicitly setting minimal keeps latency low and avoids
+             * accidentally using an unsupported 2.5-style thinkingBudget.
+             */
+            setup.put(
+                "generationConfig",
+                generationConfig
+                    .put(
+                        "thinkingConfig",
+                        JSONObject()
+                            .put(
+                                "thinkingLevel",
+                                "minimal"
+                            )
+                    )
+            )
+        }
+
+
+        /*
+         * Automatic activity detection.
+         *
+         * Keep the previously working values.
+         */
+        setup.put(
+            "realtimeInputConfig",
+            JSONObject()
                 .put(
-                    "realtimeInputConfig",
+                    "automaticActivityDetection",
                     JSONObject()
                         .put(
-                            "automaticActivityDetection",
-                            JSONObject()
-                                .put(
-                                    "disabled",
-                                    false
-                                )
-                                .put(
-                                    "prefixPaddingMs",
-                                    10
-                                )
-                                .put(
-                                    "silenceDurationMs",
-                                    40
-                                )
+                            "disabled",
+                            false
+                        )
+                        .put(
+                            "prefixPaddingMs",
+                            10
+                        )
+                        .put(
+                            "silenceDurationMs",
+                            40
                         )
                 )
+        )
 
-        /**
-         * Add tools only when configured.
+
+        /*
+         * Tools.
          */
         cfg.toolsJson
             ?.takeIf {
@@ -501,6 +742,7 @@ class GeminiLiveClient(
                 )
             }
 
+
         val message =
             JSONObject()
                 .put(
@@ -510,7 +752,8 @@ class GeminiLiveClient(
 
         try {
 
-            lastOutgoingLabel = "setup"
+            lastOutgoingLabel =
+                "setup"
 
             ws.send(
                 message.toString()
@@ -533,26 +776,23 @@ class GeminiLiveClient(
 
 
     /**
-     * Sends 16kHz mono PCM16 microphone audio.
+     * Stream 16kHz mono PCM16 microphone audio.
      *
-     * IMPORTANT:
-     * Gemini Live expects realtimeInput.audio.
-     *
-     * We intentionally DO NOT use the old mediaChunks structure.
+     * This format works for both 2.5 and 3.1.
      */
     fun sendAudio(
         pcm: ByteArray
     ) {
 
-        /**
-         * Do not send audio before setupComplete.
+        /*
+         * Never send before setupComplete.
          */
         if (!sessionReady.get()) {
             return
         }
 
-        /**
-         * PCM16 must contain complete 16-bit samples.
+        /*
+         * PCM16 = 2 bytes/sample.
          */
         if (
             pcm.isEmpty() ||
@@ -571,6 +811,11 @@ class GeminiLiveClient(
             return
         }
 
+        /*
+         * Current Live API format.
+         *
+         * DO NOT use mediaChunks.
+         */
         val audio =
             JSONObject()
                 .put(
@@ -583,14 +828,6 @@ class GeminiLiveClient(
                     b64
                 )
 
-        /**
-         * CURRENT Live API format:
-         *
-         * realtimeInput:
-         *   audio:
-         *     mimeType
-         *     data
-         */
         val message =
             JSONObject()
                 .put(
@@ -610,7 +847,17 @@ class GeminiLiveClient(
 
 
     /**
-     * Sends typed text.
+     * Send typed text.
+     *
+     * IMPORTANT:
+     *
+     * Gemini 2.5:
+     *     clientContent
+     *
+     * Gemini 3.1:
+     *     realtimeInput.text
+     *
+     * This is one of the main fixes.
      */
     fun sendText(
         text: String
@@ -630,6 +877,46 @@ class GeminiLiveClient(
             return
         }
 
+
+        /*
+         * Gemini 3.1 requires realtimeInput.text
+         * for normal conversation updates.
+         */
+        if (isGemini31()) {
+
+            val message =
+                JSONObject()
+                    .put(
+                        "realtimeInput",
+                        JSONObject()
+                            .put(
+                                "text",
+                                text
+                            )
+                    )
+
+            if (
+                safeSend(
+                    message.toString(),
+                    "text"
+                )
+            ) {
+
+                synchronized(historyLock) {
+
+                    pendingUserText.append(
+                        text
+                    )
+                }
+            }
+
+            return
+        }
+
+
+        /*
+         * Original Gemini 2.5 behavior.
+         */
         val turn =
             JSONObject()
                 .put(
@@ -664,15 +951,27 @@ class GeminiLiveClient(
                         )
                 )
 
-        safeSend(
-            message.toString(),
-            "text"
-        )
+        if (
+            safeSend(
+                message.toString(),
+                "text"
+            )
+        ) {
+
+            synchronized(historyLock) {
+
+                pendingUserText.append(
+                    text
+                )
+            }
+        }
     }
 
 
     /**
-     * Sends function-call responses.
+     * Send function-call responses.
+     *
+     * Synchronous function calling is supported.
      */
     fun sendToolResponse(
         responses: List<GeminiFunctionResponse>
@@ -697,7 +996,7 @@ class GeminiLiveClient(
 
         responses.forEach { r ->
 
-            val functionResponse =
+            val fr =
                 JSONObject()
                     .put(
                         "name",
@@ -712,21 +1011,18 @@ class GeminiLiveClient(
                             )
                     )
 
-            /**
-             * Empty function-call IDs are invalid,
-             * therefore only add when available.
+            /*
+             * Empty function-call IDs are invalid.
              */
             if (r.id.isNotBlank()) {
 
-                functionResponse.put(
+                fr.put(
                     "id",
                     r.id
                 )
             }
 
-            arr.put(
-                functionResponse
-            )
+            arr.put(fr)
         }
 
         val message =
@@ -748,7 +1044,7 @@ class GeminiLiveClient(
 
 
     /**
-     * Handles incoming Gemini Live messages.
+     * Handle incoming server messages.
      */
     private fun handleMessage(
         raw: String
@@ -759,12 +1055,23 @@ class GeminiLiveClient(
             val obj =
                 JSONObject(raw)
 
-            /**
-             * Setup handshake completed.
+
+            /*
+             * Setup complete.
              */
-            if (obj.has("setupComplete")) {
+            if (
+                obj.has(
+                    "setupComplete"
+                )
+            ) {
 
                 sessionReady.set(true)
+
+                /*
+                 * For Gemini 3.1 the server has been told that
+                 * initial history may arrive via clientContent.
+                 */
+                restoreConversationHistory()
 
                 onEvent(
                     GeminiEvent.SetupComplete
@@ -774,43 +1081,53 @@ class GeminiLiveClient(
             }
 
 
-            /**
-             * Function calling.
+            /*
+             * Function calls.
              */
-            if (obj.has("toolCall")) {
+            if (
+                obj.has("toolCall")
+            ) {
 
-                val functionCalls =
+                val fcs =
                     obj
-                        .getJSONObject("toolCall")
+                        .getJSONObject(
+                            "toolCall"
+                        )
                         .optJSONArray(
                             "functionCalls"
                         )
 
-                if (functionCalls != null) {
+                if (fcs != null) {
 
                     val calls =
                         ArrayList<GeminiFunctionCall>()
 
                     for (
-                        i in 0 until functionCalls.length()
+                        i in 0 until fcs.length()
                     ) {
 
-                        val call =
-                            functionCalls
-                                .getJSONObject(i)
+                        val c =
+                            fcs.getJSONObject(i)
 
                         calls.add(
                             GeminiFunctionCall(
-                                call.optString("id"),
-                                call.optString("name"),
-                                call.optJSONObject(
+                                c.optString(
+                                    "id"
+                                ),
+                                c.optString(
+                                    "name"
+                                ),
+                                c.optJSONObject(
                                     "args"
-                                ) ?: JSONObject()
+                                )
+                                    ?: JSONObject()
                             )
                         )
                     }
 
-                    if (calls.isNotEmpty()) {
+                    if (
+                        calls.isNotEmpty()
+                    ) {
 
                         onEvent(
                             GeminiEvent.ToolCall(
@@ -824,22 +1141,26 @@ class GeminiLiveClient(
             }
 
 
-            /**
+            /*
              * Server content.
              */
-            if (obj.has("serverContent")) {
+            if (
+                obj.has(
+                    "serverContent"
+                )
+            ) {
 
-                val serverContent =
+                val sc =
                     obj.getJSONObject(
                         "serverContent"
                     )
 
 
-                /**
-                 * User interruption.
+                /*
+                 * User interrupted model.
                  */
                 if (
-                    serverContent.optBoolean(
+                    sc.optBoolean(
                         "interrupted",
                         false
                     )
@@ -851,18 +1172,40 @@ class GeminiLiveClient(
                 }
 
 
-                /**
+                /*
                  * Input transcription.
                  */
-                serverContent
+                sc
                     .optJSONObject(
                         "inputTranscription"
                     )
-                    ?.optString("text")
+                    ?.optString(
+                        "text"
+                    )
                     ?.takeIf {
                         it.isNotEmpty()
                     }
                     ?.let {
+
+                        synchronized(
+                            historyLock
+                        ) {
+
+                            /*
+                             * Avoid double-appending typed text
+                             * when transcription is also received.
+                             */
+                            if (
+                                pendingUserText
+                                    .toString()
+                                    .isEmpty()
+                            ) {
+
+                                pendingUserText.append(
+                                    it
+                                )
+                            }
+                        }
 
                         onEvent(
                             GeminiEvent.InputTranscript(
@@ -872,18 +1215,29 @@ class GeminiLiveClient(
                     }
 
 
-                /**
+                /*
                  * Output transcription.
                  */
-                serverContent
+                sc
                     .optJSONObject(
                         "outputTranscription"
                     )
-                    ?.optString("text")
+                    ?.optString(
+                        "text"
+                    )
                     ?.takeIf {
                         it.isNotEmpty()
                     }
                     ?.let {
+
+                        synchronized(
+                            historyLock
+                        ) {
+
+                            pendingModelText.append(
+                                it
+                            )
+                        }
 
                         onEvent(
                             GeminiEvent.OutputTranscript(
@@ -893,10 +1247,15 @@ class GeminiLiveClient(
                     }
 
 
-                /**
-                 * Model audio response.
+                /*
+                 * IMPORTANT:
+                 *
+                 * Gemini 3.1 may put multiple parts in ONE
+                 * serverContent event.
+                 *
+                 * Process ALL parts.
                  */
-                serverContent
+                sc
                     .optJSONObject(
                         "modelTurn"
                     )
@@ -912,6 +1271,10 @@ class GeminiLiveClient(
                             val part =
                                 parts.getJSONObject(i)
 
+
+                            /*
+                             * Audio response.
+                             */
                             part
                                 .optJSONObject(
                                     "inlineData"
@@ -930,22 +1293,33 @@ class GeminiLiveClient(
                                         )
                                     ) {
 
-                                        val pcm =
-                                            Base64.decode(
-                                                data.getString(
-                                                    "data"
-                                                ),
-                                                Base64.NO_WRAP
-                                            )
+                                        try {
 
-                                        if (
-                                            pcm.isNotEmpty()
-                                        ) {
-
-                                            onEvent(
-                                                GeminiEvent.AudioChunk(
-                                                    pcm
+                                            val pcm =
+                                                Base64.decode(
+                                                    data.getString(
+                                                        "data"
+                                                    ),
+                                                    Base64.NO_WRAP
                                                 )
+
+                                            if (
+                                                pcm.isNotEmpty()
+                                            ) {
+
+                                                onEvent(
+                                                    GeminiEvent.AudioChunk(
+                                                        pcm
+                                                    )
+                                                )
+                                            }
+
+                                        } catch (e: Exception) {
+
+                                            Logger.e(
+                                                TAG,
+                                                "Audio decode failed",
+                                                e
                                             )
                                         }
                                     }
@@ -954,15 +1328,17 @@ class GeminiLiveClient(
                     }
 
 
-                /**
-                 * Turn completed.
+                /*
+                 * Completed turn.
                  */
                 if (
-                    serverContent.optBoolean(
+                    sc.optBoolean(
                         "turnComplete",
                         false
                     )
                 ) {
+
+                    commitPendingTurn()
 
                     onEvent(
                         GeminiEvent.TurnComplete
@@ -982,7 +1358,148 @@ class GeminiLiveClient(
 
 
     /**
-     * Reconnect with exponential backoff.
+     * Commit completed text turn.
+     */
+    private fun commitPendingTurn() {
+
+        synchronized(
+            historyLock
+        ) {
+
+            val user =
+                pendingUserText
+                    .toString()
+                    .trim()
+
+            val model =
+                pendingModelText
+                    .toString()
+                    .trim()
+
+            if (
+                user.isNotEmpty()
+            ) {
+
+                history.addLast(
+                    HistoryTurn(
+                        "user",
+                        user
+                    )
+                )
+            }
+
+            if (
+                model.isNotEmpty()
+            ) {
+
+                history.addLast(
+                    HistoryTurn(
+                        "model",
+                        model
+                    )
+                )
+            }
+
+            pendingUserText =
+                StringBuilder()
+
+            pendingModelText =
+                StringBuilder()
+        }
+    }
+
+
+    /**
+     * Restore current-session history after reconnect.
+     *
+     * For Gemini 3.1 this is allowed because setup contains:
+     *
+     * historyConfig.initialHistoryInClientContent = true
+     *
+     * For Gemini 2.5 this remains the original behavior.
+     */
+    private fun restoreConversationHistory() {
+
+        val turns =
+            synchronized(
+                historyLock
+            ) {
+                history.toList()
+            }
+
+        if (
+            turns.isEmpty() ||
+            !sessionReady.get()
+        ) {
+            return
+        }
+
+        val arr =
+            JSONArray()
+
+        turns.forEach { turn ->
+
+            if (
+                turn.text.isNotBlank()
+            ) {
+
+                arr.put(
+                    JSONObject()
+                        .put(
+                            "role",
+                            turn.role
+                        )
+                        .put(
+                            "parts",
+                            JSONArray()
+                                .put(
+                                    JSONObject()
+                                        .put(
+                                            "text",
+                                            turn.text
+                                        )
+                                )
+                        )
+                )
+            }
+        }
+
+        if (
+            arr.length() == 0
+        ) {
+            return
+        }
+
+        val message =
+            JSONObject()
+                .put(
+                    "clientContent",
+                    JSONObject()
+                        .put(
+                            "turns",
+                            arr
+                        )
+                        .put(
+                            "turnComplete",
+                            true
+                        )
+                )
+
+        safeSend(
+            message.toString(),
+            "history"
+        )
+
+        Logger.i(
+            TAG,
+            "Restored complete current-session history: " +
+                    "${turns.size} turns after reconnect"
+        )
+    }
+
+
+    /**
+     * Reconnect.
      */
     private fun reconnect(
         immediate: Boolean = false
@@ -996,7 +1513,9 @@ class GeminiLiveClient(
 
         renewJob?.cancel()
 
-        scope.launch(Dispatchers.IO) {
+        scope.launch(
+            Dispatchers.IO
+        ) {
 
             val delayMs =
                 if (immediate) {
@@ -1013,12 +1532,13 @@ class GeminiLiveClient(
                                                 .coerceAtMost(5)
                                     )
                         )
-                        .coerceAtMost(
-                            Constants.RECONNECT_MAX_DELAY_MS
-                        )
+                            .coerceAtMost(
+                                Constants.RECONNECT_MAX_DELAY_MS
+                            )
                 }
 
             if (!immediate) {
+
                 reconnectAttempts++
             }
 
@@ -1030,7 +1550,10 @@ class GeminiLiveClient(
 
             delay(delayMs)
 
-            if (running.get()) {
+            if (
+                running.get()
+            ) {
+
                 openSocket()
             }
         }
@@ -1038,7 +1561,7 @@ class GeminiLiveClient(
 
 
     /**
-     * Renews the Live session periodically.
+     * Periodic session renewal.
      */
     private fun scheduleRenew() {
 
@@ -1051,7 +1574,9 @@ class GeminiLiveClient(
                     Constants.SESSION_RENEW_MS
                 )
 
-                if (running.get()) {
+                if (
+                    running.get()
+                ) {
 
                     Logger.i(
                         TAG,
@@ -1068,7 +1593,7 @@ class GeminiLiveClient(
 
 
     /**
-     * Fully closes the Live session.
+     * Close client.
      */
     fun close() {
 
@@ -1110,5 +1635,14 @@ class GeminiLiveClient(
 
         private const val NORMAL_CLOSURE =
             1000
+
+        /*
+         * Preserve original per-API-key model cache.
+         */
+        private val modelCache =
+            java.util.concurrent.ConcurrentHashMap<
+                    String,
+                    String
+                    >()
     }
 }
