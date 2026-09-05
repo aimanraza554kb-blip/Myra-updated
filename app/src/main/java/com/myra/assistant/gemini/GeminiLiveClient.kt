@@ -286,10 +286,10 @@ class GeminiLiveClient(
                     "automaticActivityDetection",
                     JSONObject()
                         .put("disabled", false)
-                        .put("prefixPaddingMs", 20)
+                        .put("prefixPaddingMs", 10)
                         // Robust server-side fallback. The client also sends
                         // audioStreamEnd after local silence for fast finalization.
-                        .put("silenceDurationMs", 500)
+                        .put("silenceDurationMs", 40)
                 )
             )
 
