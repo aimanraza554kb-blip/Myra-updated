@@ -319,7 +319,7 @@ class VoiceSessionManager(
     /** Interrupt MYRA while she is speaking. */
     fun interrupt() = player?.flush()
 
-    fun stop() {
+    fun stop(notifyStopped: Boolean = true) {
         _active.value = false
         recorder?.stop(); recorder = null
         player?.stop(); player = null
@@ -335,7 +335,7 @@ class VoiceSessionManager(
             lastSpeechAtMs = 0L
             audioEndSentForTurn = false
         }
-        onSessionStopped?.invoke()
+        if (notifyStopped) onSessionStopped?.invoke()
     }
 
     companion object {
