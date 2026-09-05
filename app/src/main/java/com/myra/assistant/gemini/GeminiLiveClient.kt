@@ -86,6 +86,9 @@ class GeminiLiveClient(
         }
     }
 
+    /** True when the current Live socket has completed the setup handshake. */
+    fun isSessionReady(): Boolean = sessionReady.get()
+
     fun connect(config: GeminiConfig) {
         this.config = config
         running.set(true)
