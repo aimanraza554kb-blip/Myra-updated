@@ -279,10 +279,10 @@ class GeminiLiveClient(
                 "automaticActivityDetection",
                 JSONObject()
                     .put("disabled", false)
-                    .put("prefixPaddingMs", 0)
+                    .put("prefixPaddingMs", 10)
                     // Keep the same low-latency setting used by the original working build.
                     // The user expects MYRA to answer immediately after speaking.
-                    .put("silenceDurationMs", 20)
+                    .put("silenceDurationMs", 40)
             )
         )
 
