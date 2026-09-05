@@ -50,7 +50,7 @@ class MyraForegroundService : Service() {
         if (manualStart) {
             // Manual Start always means "start Gemini now", regardless of the
             // wake-word toggle. The normal session.start() path is untouched.
-            ServiceLocator.voiceSessionManager.ensureStarted()
+            ServiceLocator.voiceSessionManager.start()
             if (ServiceLocator.settingsRepository.wakeWordEnabled()) {
                 watchSessionState()
             }
@@ -59,7 +59,7 @@ class MyraForegroundService : Service() {
             watchSessionState()
         } else {
             // Existing behavior when wake-word mode is disabled.
-            ServiceLocator.voiceSessionManager.ensureStarted()
+            ServiceLocator.voiceSessionManager.start()
         }
 
         Logger.i(TAG, "Foreground service started")
@@ -89,7 +89,7 @@ class MyraForegroundService : Service() {
                 Logger.i(TAG, "Wake word detected; starting existing MYRA session")
                 // IMPORTANT: use the exact same VoiceSessionManager.start() path
                 // as the working app. No new GeminiConfig or API-key handling here.
-                ServiceLocator.voiceSessionManager.ensureStarted()
+                ServiceLocator.voiceSessionManager.start()
             }
         )
 
