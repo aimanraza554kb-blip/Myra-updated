@@ -298,7 +298,7 @@ class GeminiLiveClient(
     }
 
     /** True when the WebSocket session has completed setup. */
-    fun isSessionReady(): Boolean = webSocket != null && running.get()
+    fun isSessionReady(): Boolean = sessionReady.get()
 
     /** Send a typed text turn (used by the chat input box). */
     fun sendText(text: String) {
