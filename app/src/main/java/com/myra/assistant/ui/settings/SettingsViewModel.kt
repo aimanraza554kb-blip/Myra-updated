@@ -15,7 +15,10 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
     private val settings = ServiceLocator.settingsRepository
 
     fun apiKey() = settings.apiKey()
-    fun setApiKey(value: String) = settings.setApiKey(value)
+    fun setApiKey(value: String) {
+        settings.setApiKey(value)
+        ServiceLocator.voiceSessionManager.restart()
+    }
 
     fun model() = settings.model()
     fun setModel(model: GeminiModel) {
@@ -48,7 +51,10 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
     fun setUserProfile(value: String) = settings.setUserProfile(value)
 
     fun customPersonality() = settings.customPersonality()
-    fun setCustomPersonality(value: String) = settings.setCustomPersonality(value)
+    fun setCustomPersonality(value: String) {
+        settings.setCustomPersonality(value)
+        ServiceLocator.voiceSessionManager.restart()
+    }
 
     fun primeContacts() = settings.primeContacts()
     fun setPrimeContacts(value: String) = settings.setPrimeContacts(value)
