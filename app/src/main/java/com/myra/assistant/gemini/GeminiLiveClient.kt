@@ -59,12 +59,7 @@ class GeminiLiveClient(
     // continuously across the 9-minute session renewal and across reconnects,
     // this gate is what actually prevents the mid-session 1007 disconnect loop.
     private val sessionReady = AtomicBoolean(false)
-    // Buffer a short microphone window while a fresh Live socket completes setup.
-    // This prevents the first spoken words after reopen/reconnect from being lost.
-    // VAD and response timing are intentionally unchanged.
-    private val pendingAudio = ArrayDeque<ByteArray>()
-    private val pendingAudioLock = Any()
-    private val maxPendingAudioFrames = 50
+    private var initialHistoryConfigured = false
     // Prevents overlapping (re)connect attempts from opening duplicate sockets.
     private val connecting = AtomicBoolean(false)
     // Remembers the last frame type sent, so a 1007 close names the culprit.
@@ -92,7 +87,7 @@ class GeminiLiveClient(
         }
     }
 
-    /** True when the current Live socket has completed the setup handshake. */
+    /** True only after the current WebSocket has completed the setup handshake. */
     fun isSessionReady(): Boolean = sessionReady.get()
 
     fun connect(config: GeminiConfig) {
@@ -143,10 +138,19 @@ class GeminiLiveClient(
                     onEvent(GeminiEvent.Error("This API key has no Live (bidiGenerateContent) models enabled."))
                     return
                 }
-                val chosen = if (bidi.any { it == cfg.model }) cfg.model else bidi.first()
+                val preferred = listOf(
+                    cfg.model,
+                    "gemini-3.1-flash-live-preview",
+                    "gemini-2.5-flash-native-audio-preview-12-2025"
+                ).distinct()
+                val chosen = preferred.firstOrNull { bidi.contains(it) }
+                    ?: run {
+                        onEvent(GeminiEvent.Error("No supported native-audio Gemini Live model is available for this API key."))
+                        return
+                    }
                 if (chosen != cfg.model) {
                     config = cfg.copy(model = chosen)
-                    Logger.i(TAG, "Model ${cfg.model} unavailable; switching to $chosen")
+                    Logger.i(TAG, "Model ${cfg.model} unavailable; switching to supported Live audio model $chosen")
                 }
                 modelCache[cfg.apiKey] = chosen
             }
@@ -171,7 +175,7 @@ class GeminiLiveClient(
         // completes and fully discard the previous socket so we never reuse a
         // half-dead session or leak a stale reference.
         sessionReady.set(false)
-        synchronized(pendingAudioLock) { pendingAudio.clear() }
+        initialHistoryConfigured = false
         webSocket?.let { old ->
             webSocket = null
             try { old.cancel() } catch (_: Exception) {}
@@ -206,6 +210,7 @@ class GeminiLiveClient(
         }
 
         override fun onClosing(ws: WebSocket, code: Int, reason: String) {
+            if (webSocket !== ws) return
             ws.close(NORMAL_CLOSURE, null)
         }
 
@@ -239,7 +244,7 @@ class GeminiLiveClient(
             }
             Logger.e(TAG, "WebSocket failure: $detail", t)
             onEvent(GeminiEvent.Error(detail))
-            if (running.get()) reconnect()
+            if (running.get() && !isQuotaOrRateLimit(detail)) reconnect()
         }
     }
 
@@ -252,6 +257,16 @@ class GeminiLiveClient(
         val generationConfig = JSONObject()
             .put("responseModalities", JSONArray().put("AUDIO"))
             .put("speechConfig", speechConfig)
+
+        if (cfg.model == "gemini-3.1-flash-live-preview") {
+            generationConfig.put(
+                "thinkingConfig",
+                JSONObject().put("thinkingLevel", "minimal")
+            )
+        }
+        initialHistoryConfigured = cfg.model == "gemini-3.1-flash-live-preview" && synchronized(historyLock) {
+            history.isNotEmpty()
+        }
 
         val setup = JSONObject()
             .put("model", "models/" + cfg.model)
@@ -271,13 +286,19 @@ class GeminiLiveClient(
                     "automaticActivityDetection",
                     JSONObject()
                         .put("disabled", false)
-                        .put("prefixPaddingMs", 10)
-                        // Practically the floor: commit end-of-turn after ~2 silent
-                        // 20ms frames so MYRA starts replying almost instantly. Going
-                        // lower risks cutting the user off during natural pauses.
-                        .put("silenceDurationMs", 40)
+                        .put("prefixPaddingMs", 20)
+                        // Robust server-side fallback. The client also sends
+                        // audioStreamEnd after local silence for fast finalization.
+                        .put("silenceDurationMs", 500)
                 )
             )
+
+        if (initialHistoryConfigured) {
+            setup.put(
+                "historyConfig",
+                JSONObject().put("initialHistoryInClientContent", true)
+            )
+        }
 
         cfg.toolsJson?.takeIf { it.isNotBlank() }?.let { setup.put("tools", JSONArray(it)) }
 
@@ -295,25 +316,17 @@ class GeminiLiveClient(
 
     /** Stream a chunk of 16kHz mono PCM16 microphone audio to Gemini. */
     fun sendAudio(pcm: ByteArray) {
+        // Root-cause guard: never stream audio until the current session's setup
+        // handshake is acknowledged. This is what stops the mic from hitting a
+        // freshly-reconnected/renewed socket before setupComplete (the 1007).
+        if (!sessionReady.get()) return
         // Never forward empty or misaligned frames (PCM16 = 2 bytes/sample).
         if (pcm.isEmpty() || pcm.size % 2 != 0) return
-
-        // The recorder can start before Gemini sends setupComplete. Keep up to
-        // ~1 second of 20ms frames instead of silently dropping the utterance.
-        if (!sessionReady.get()) {
-            synchronized(pendingAudioLock) {
-                if (pendingAudio.size >= maxPendingAudioFrames) pendingAudio.removeFirst()
-                pendingAudio.addLast(pcm.copyOf())
-            }
-            return
-        }
-
-        sendAudioFrame(pcm)
-    }
-
-    private fun sendAudioFrame(pcm: ByteArray) {
         val b64 = Base64.encodeToString(pcm, Base64.NO_WRAP)
         if (b64.isBlank()) return
+        // Current Gemini Live WebSocket schema uses realtimeInput.audio directly.
+        // The older realtimeInput.mediaChunks field is deprecated and now causes
+        // server close 1007 (invalid argument).
         val audio = JSONObject()
             .put("mimeType", "audio/pcm;rate=" + Constants.INPUT_SAMPLE_RATE)
             .put("data", b64)
@@ -324,10 +337,30 @@ class GeminiLiveClient(
         safeSend(message.toString(), "audio")
     }
 
+    /** Finalize the current audio stream while automatic server VAD remains enabled. */
+    fun sendAudioStreamEnd() {
+        if (!sessionReady.get()) return
+        val message = JSONObject().put(
+            "realtimeInput",
+            JSONObject().put("audioStreamEnd", true)
+        )
+        safeSend(message.toString(), "audioStreamEnd")
+    }
+
     /** Send a typed text turn (used by the chat input box). */
     fun sendText(text: String) {
         if (!sessionReady.get()) { Logger.w(TAG, "Drop text: session not ready"); return }
         if (text.isBlank()) return
+        if (config?.model == "gemini-3.1-flash-live-preview") {
+            val message = JSONObject().put(
+                "realtimeInput",
+                JSONObject().put("text", text)
+            )
+            if (safeSend(message.toString(), "text")) {
+                synchronized(historyLock) { pendingUserText.append(text) }
+            }
+            return
+        }
         val turn = JSONObject()
             .put("role", "user")
             .put("parts", JSONArray().put(JSONObject().put("text", text)))
@@ -363,16 +396,21 @@ class GeminiLiveClient(
     private fun handleMessage(raw: String) {
         try {
             val obj = JSONObject(raw)
+            if (obj.has("error")) {
+                val err = obj.optJSONObject("error")
+                val status = err?.optString("status").orEmpty()
+                val message = err?.optString("message").orEmpty()
+                val detail = listOf(status, message).filter { it.isNotBlank() }.joinToString(": ")
+                    .ifBlank { "Gemini Live API error" }
+                Logger.e(TAG, "Server error: $detail")
+                onEvent(GeminiEvent.Error(detail))
+                if (isQuotaOrRateLimit(detail)) running.set(false)
+                return
+            }
             if (obj.has("setupComplete")) {
                 // Handshake done: it is now safe to stream audio and tool results.
                 sessionReady.set(true)
                 restoreConversationHistory()
-                val queuedAudio = synchronized(pendingAudioLock) {
-                    val copy = pendingAudio.toList()
-                    pendingAudio.clear()
-                    copy
-                }
-                queuedAudio.forEach { sendAudioFrame(it) }
                 onEvent(GeminiEvent.SetupComplete)
                 return
             }
@@ -449,6 +487,7 @@ class GeminiLiveClient(
     private fun restoreConversationHistory() {
         val turns = synchronized(historyLock) { history.toList() }
         if (turns.isEmpty() || !sessionReady.get()) return
+        if (config?.model == "gemini-3.1-flash-live-preview" && !initialHistoryConfigured) return
 
         val arr = JSONArray()
         turns.forEach { turn ->
@@ -468,6 +507,15 @@ class GeminiLiveClient(
         )
         safeSend(message.toString(), "history")
         Logger.i(TAG, "Restored complete current-session history: ${turns.size} turns after reconnect")
+    }
+
+    private fun isQuotaOrRateLimit(detail: String): Boolean {
+        val text = detail.lowercase()
+        return text.contains("quota") ||
+            text.contains("rate limit") ||
+            text.contains("resource_exhausted") ||
+            text.contains("too many requests") ||
+            text.contains("429")
     }
 
     private fun reconnect(immediate: Boolean = false) {
@@ -500,7 +548,6 @@ class GeminiLiveClient(
         sessionReady.set(false)
         connecting.set(false)
         renewJob?.cancel()
-        synchronized(pendingAudioLock) { pendingAudio.clear() }
         webSocket?.let { try { it.close(NORMAL_CLOSURE, "client closed") } catch (_: Exception) {} }
         webSocket = null
         onEvent(GeminiEvent.StateChanged(ConnectionState.IDLE))
