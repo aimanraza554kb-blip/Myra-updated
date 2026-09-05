@@ -110,9 +110,11 @@ class GeminiLiveClient(
      */
     private fun resolveWorkingModel(cfg: GeminiConfig) {
         if (cfg.apiKey.isBlank()) return
-        // Skip the ListModels round-trip if we already resolved a good model for
-        // this key earlier in the process - makes reconnects/renewals faster.
-        modelCache[cfg.apiKey]?.let { cached ->
+        // Cache is scoped to BOTH the API key and the model requested by Settings.
+        // A cache keyed only by API key could lock the user onto 2.5 after it was
+        // selected once, making a later switch to Gemini 3.1 silently use 2.5.
+        val cacheKey = cfg.apiKey + "|" + cfg.model
+        modelCache[cacheKey]?.let { cached ->
             if (cfg.model != cached) config = cfg.copy(model = cached)
             return
         }
@@ -152,7 +154,7 @@ class GeminiLiveClient(
                     config = cfg.copy(model = chosen)
                     Logger.i(TAG, "Model ${cfg.model} unavailable; switching to supported Live audio model $chosen")
                 }
-                modelCache[cfg.apiKey] = chosen
+                modelCache[cacheKey] = chosen
             }
         } catch (e: Exception) {
             Logger.e(TAG, "Model resolution failed", e)
@@ -556,8 +558,8 @@ class GeminiLiveClient(
     companion object {
         private const val TAG = "GeminiLiveClient"
         private const val NORMAL_CLOSURE = 1000
-        // Per-API-key cache of a known Live-capable model, shared across sessions
-        // in this process so we only run model discovery once.
+        // Cache is scoped by API key + requested model so changing the model in
+        // Settings never reuses a previous model choice for the same key.
         private val modelCache = java.util.concurrent.ConcurrentHashMap<String, String>()
     }
 }
