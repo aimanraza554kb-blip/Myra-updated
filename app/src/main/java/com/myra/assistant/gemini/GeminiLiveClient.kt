@@ -288,10 +288,12 @@ class GeminiLiveClient(
                     "automaticActivityDetection",
                     JSONObject()
                         .put("disabled", false)
-                        .put("prefixPaddingMs", 10)
-                        // Robust server-side fallback. The client also sends
-                        // audioStreamEnd after local silence for fast finalization.
-                        .put("silenceDurationMs", 40)
+                        // Gemini 3.1 is more sensitive to ultra-short turn boundaries.
+                        // Keep 2.5 at the requested 10/40ms fast settings, but use
+                        // Google's current low-latency 3.1 VAD range here so speech
+                        // is not fragmented before the client-side audioStreamEnd.
+                        .put("prefixPaddingMs", if (cfg.model == "gemini-3.1-flash-live-preview") 20 else 10)
+                        .put("silenceDurationMs", if (cfg.model == "gemini-3.1-flash-live-preview") 100 else 40)
                 )
             )
 
