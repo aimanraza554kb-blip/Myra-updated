@@ -220,10 +220,7 @@ class GeminiLiveClient(
             }
             Logger.e(TAG, "WebSocket failure: $detail", t)
             onEvent(GeminiEvent.Error(detail))
-            // Do not hammer the API after a quota/rate-limit rejection. Gemini
-            // rate limits are project-level, so reconnecting with the same key
-            // cannot recover from a 429 and can make the situation worse.
-            if (running.get() && !isQuotaOrRateLimit(detail)) reconnect()
+            if (running.get()) reconnect()
         }
     }
 
@@ -243,39 +240,25 @@ class GeminiLiveClient(
             .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", cfg.systemInstruction))))
             .put("inputAudioTranscription", JSONObject())
             .put("outputAudioTranscription", JSONObject())
-
-        // Gemini 3.1 thinking stays minimal for low-latency voice replies.
-        // Conversation history is restored AFTER setupComplete via clientContent;
-        // do not enable initialHistoryInClientContent in setup because it can put
-        // a freshly opened Live session into an initial-history waiting state.
-        if (cfg.model == "gemini-3.1-flash-live-preview") {
-            setup.put(
-                "generationConfig",
-                generationConfig.put(
-                    "thinkingConfig",
-                    JSONObject().put("thinkingLevel", "minimal")
+            // Low-latency turn-taking: as soon as the user stops speaking we want a
+            // reply almost immediately. Only the numeric VAD fields are set here.
+            // NOTE: do NOT add startOfSpeechSensitivity/endOfSpeechSensitivity enums
+            // - those were rejected by the Live API with close code 1007 ("invalid
+            // argument"). The disabled/prefixPaddingMs/silenceDurationMs shape below
+            // matches Google's documented working setup.
+            .put(
+                "realtimeInputConfig",
+                JSONObject().put(
+                    "automaticActivityDetection",
+                    JSONObject()
+                        .put("disabled", false)
+                        .put("prefixPaddingMs", 10)
+                        // Practically the floor: commit end-of-turn after ~2 silent
+                        // 20ms frames so MYRA starts replying almost instantly. Going
+                        // lower risks cutting the user off during natural pauses.
+                        .put("silenceDurationMs", 40)
                 )
             )
-        }
-
-        // Low-latency turn-taking: as soon as the user stops speaking we want a
-        // reply almost immediately. Only the numeric VAD fields are set here.
-        // NOTE: do NOT add startOfSpeechSensitivity/endOfSpeechSensitivity enums
-        // - those were rejected by the Live API with close code 1007 ("invalid
-        // argument"). The disabled/prefixPaddingMs/silenceDurationMs shape below
-        // matches Google's documented working setup.
-        setup.put(
-            "realtimeInputConfig",
-            JSONObject().put(
-                "automaticActivityDetection",
-                JSONObject()
-                    .put("disabled", false)
-                    .put("prefixPaddingMs", 10)
-                    // Keep the same low-latency setting used by the original working build.
-                    // The user expects MYRA to answer immediately after speaking.
-                    .put("silenceDurationMs", 40)
-            )
-        )
 
         cfg.toolsJson?.takeIf { it.isNotBlank() }?.let { setup.put("tools", JSONArray(it)) }
 
@@ -314,30 +297,13 @@ class GeminiLiveClient(
         safeSend(message.toString(), "audio")
     }
 
-    /** True when this client has completed the Live setup handshake. */
-    fun isSessionReady(): Boolean = sessionReady.get()
+    /** True when the WebSocket session has completed setup. */
+    fun isSessionReady(): Boolean = webSocket != null && running.get()
 
     /** Send a typed text turn (used by the chat input box). */
     fun sendText(text: String) {
         if (!sessionReady.get()) { Logger.w(TAG, "Drop text: session not ready"); return }
         if (text.isBlank()) return
-
-        // Gemini 3.1 uses realtimeInput.text for normal conversation turns.
-        // clientContent is reserved for initial history seeding on 3.1.
-        if (config?.model == "gemini-3.1-flash-live-preview") {
-            val message = JSONObject().put(
-                "realtimeInput",
-                JSONObject().put("text", text)
-            )
-            if (safeSend(message.toString(), "text")) {
-                synchronized(historyLock) {
-                    pendingUserText.append(text)
-                }
-            }
-            return
-        }
-
-        // Preserve the original 2.5 Live behavior.
         val turn = JSONObject()
             .put("role", "user")
             .put("parts", JSONArray().put(JSONObject().put("text", text)))
@@ -373,17 +339,6 @@ class GeminiLiveClient(
     private fun handleMessage(raw: String) {
         try {
             val obj = JSONObject(raw)
-            if (obj.has("error")) {
-                val err = obj.optJSONObject("error")
-                val status = err?.optString("status").orEmpty()
-                val message = err?.optString("message").orEmpty()
-                val detail = listOf(status, message).filter { it.isNotBlank() }.joinToString(": ")
-                    .ifBlank { "Gemini Live API error" }
-                Logger.e(TAG, "Server error: $detail")
-                onEvent(GeminiEvent.Error(detail))
-                if (isQuotaOrRateLimit(detail)) running.set(false)
-                return
-            }
             if (obj.has("setupComplete")) {
                 // Handshake done: it is now safe to stream audio and tool results.
                 sessionReady.set(true)
@@ -483,15 +438,6 @@ class GeminiLiveClient(
         )
         safeSend(message.toString(), "history")
         Logger.i(TAG, "Restored complete current-session history: ${turns.size} turns after reconnect")
-    }
-
-    private fun isQuotaOrRateLimit(detail: String): Boolean {
-        val text = detail.lowercase()
-        return text.contains("quota") ||
-            text.contains("rate limit") ||
-            text.contains("resource_exhausted") ||
-            text.contains("too many requests") ||
-            text.contains("429")
     }
 
     private fun reconnect(immediate: Boolean = false) {
