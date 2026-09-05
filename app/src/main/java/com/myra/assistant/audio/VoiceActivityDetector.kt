@@ -16,7 +16,8 @@ class VoiceActivityDetector(private val speechThreshold: Double = 0.045) {
         var count = 0
         var i = 0
         while (i + 1 < pcm.size) {
-            val sample = (pcm[i].toInt() and 0xFF) or (pcm[i + 1].toInt() shl 8)
+            var sample = (pcm[i].toInt() and 0xFF) or ((pcm[i + 1].toInt() and 0xFF) shl 8)
+            if (sample and 0x8000 != 0) sample -= 0x10000
             val normalized = sample / 32768.0
             sum += normalized * normalized
             count++
