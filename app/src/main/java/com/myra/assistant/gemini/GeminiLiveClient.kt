@@ -174,11 +174,6 @@ class GeminiLiveClient(
 
     private val listener = object : WebSocketListener() {
         override fun onOpen(ws: WebSocket, response: Response) {
-            // Ignore callbacks from an older socket after a reopen/reconnect.
-            if (webSocket !== ws) {
-                Logger.w(TAG, "Ignoring onOpen from stale WebSocket")
-                return
-            }
             connecting.set(false)
             Logger.i(TAG, "WebSocket open")
             reconnectAttempts = 0
@@ -189,27 +184,15 @@ class GeminiLiveClient(
             onEvent(GeminiEvent.Connected)
         }
 
-        override fun onMessage(ws: WebSocket, text: String) {
-            if (webSocket !== ws) return
-            handleMessage(text)
-        }
+        override fun onMessage(ws: WebSocket, text: String) = handleMessage(text)
 
-        override fun onMessage(ws: WebSocket, bytes: ByteString) {
-            if (webSocket !== ws) return
-            handleMessage(bytes.utf8())
-        }
+        override fun onMessage(ws: WebSocket, bytes: ByteString) = handleMessage(bytes.utf8())
 
         override fun onClosing(ws: WebSocket, code: Int, reason: String) {
             ws.close(NORMAL_CLOSURE, null)
         }
 
         override fun onClosed(ws: WebSocket, code: Int, reason: String) {
-            // A cancelled/old socket can close after a fresh socket is already active.
-            // Its callback must never tear down or reconnect the current session.
-            if (webSocket !== ws) {
-                Logger.w(TAG, "Ignoring onClosed from stale WebSocket")
-                return
-            }
             sessionReady.set(false)
             connecting.set(false)
             Logger.i(TAG, "WebSocket closed: $code '$reason' (last frame sent: $lastOutgoingLabel)")
@@ -223,10 +206,6 @@ class GeminiLiveClient(
         }
 
         override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-            if (webSocket !== ws) {
-                Logger.w(TAG, "Ignoring onFailure from stale WebSocket")
-                return
-            }
             sessionReady.set(false)
             connecting.set(false)
             val detail = buildString {
@@ -318,9 +297,6 @@ class GeminiLiveClient(
         safeSend(message.toString(), "audio")
     }
 
-    /** True when the WebSocket session has completed setup. */
-    fun isSessionReady(): Boolean = sessionReady.get()
-
     /** Send a typed text turn (used by the chat input box). */
     fun sendText(text: String) {
         if (!sessionReady.get()) { Logger.w(TAG, "Drop text: session not ready"); return }
@@ -363,9 +339,7 @@ class GeminiLiveClient(
             if (obj.has("setupComplete")) {
                 // Handshake done: it is now safe to stream audio and tool results.
                 sessionReady.set(true)
-                // Keep a freshly reopened/reconnected Live session clean. Sending
-                // cached clientContent immediately after setupComplete can race the
-                // first realtimeInput audio turn and leave MYRA listening silently.
+                restoreConversationHistory()
                 onEvent(GeminiEvent.SetupComplete)
                 return
             }
