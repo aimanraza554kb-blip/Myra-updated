@@ -59,6 +59,12 @@ class GeminiLiveClient(
     // continuously across the 9-minute session renewal and across reconnects,
     // this gate is what actually prevents the mid-session 1007 disconnect loop.
     private val sessionReady = AtomicBoolean(false)
+    // Buffer a short microphone window while a fresh Live socket completes setup.
+    // This prevents the first spoken words after reopen/reconnect from being lost.
+    // VAD and response timing are intentionally unchanged.
+    private val pendingAudio = ArrayDeque<ByteArray>()
+    private val pendingAudioLock = Any()
+    private val maxPendingAudioFrames = 50
     // Prevents overlapping (re)connect attempts from opening duplicate sockets.
     private val connecting = AtomicBoolean(false)
     // Remembers the last frame type sent, so a 1007 close names the culprit.
@@ -165,6 +171,7 @@ class GeminiLiveClient(
         // completes and fully discard the previous socket so we never reuse a
         // half-dead session or leak a stale reference.
         sessionReady.set(false)
+        synchronized(pendingAudioLock) { pendingAudio.clear() }
         webSocket?.let { old ->
             webSocket = null
             try { old.cancel() } catch (_: Exception) {}
@@ -279,17 +286,25 @@ class GeminiLiveClient(
 
     /** Stream a chunk of 16kHz mono PCM16 microphone audio to Gemini. */
     fun sendAudio(pcm: ByteArray) {
-        // Root-cause guard: never stream audio until the current session's setup
-        // handshake is acknowledged. This is what stops the mic from hitting a
-        // freshly-reconnected/renewed socket before setupComplete (the 1007).
-        if (!sessionReady.get()) return
         // Never forward empty or misaligned frames (PCM16 = 2 bytes/sample).
         if (pcm.isEmpty() || pcm.size % 2 != 0) return
+
+        // The recorder can start before Gemini sends setupComplete. Keep up to
+        // ~1 second of 20ms frames instead of silently dropping the utterance.
+        if (!sessionReady.get()) {
+            synchronized(pendingAudioLock) {
+                if (pendingAudio.size >= maxPendingAudioFrames) pendingAudio.removeFirst()
+                pendingAudio.addLast(pcm.copyOf())
+            }
+            return
+        }
+
+        sendAudioFrame(pcm)
+    }
+
+    private fun sendAudioFrame(pcm: ByteArray) {
         val b64 = Base64.encodeToString(pcm, Base64.NO_WRAP)
         if (b64.isBlank()) return
-        // Current Gemini Live WebSocket schema uses realtimeInput.audio directly.
-        // The older realtimeInput.mediaChunks field is deprecated and now causes
-        // server close 1007 (invalid argument).
         val audio = JSONObject()
             .put("mimeType", "audio/pcm;rate=" + Constants.INPUT_SAMPLE_RATE)
             .put("data", b64)
@@ -342,6 +357,12 @@ class GeminiLiveClient(
             if (obj.has("setupComplete")) {
                 // Handshake done: it is now safe to stream audio and tool results.
                 sessionReady.set(true)
+                val queuedAudio = synchronized(pendingAudioLock) {
+                    val copy = pendingAudio.toList()
+                    pendingAudio.clear()
+                    copy
+                }
+                queuedAudio.forEach { sendAudioFrame(it) }
                 restoreConversationHistory()
                 onEvent(GeminiEvent.SetupComplete)
                 return
@@ -470,6 +491,7 @@ class GeminiLiveClient(
         sessionReady.set(false)
         connecting.set(false)
         renewJob?.cancel()
+        synchronized(pendingAudioLock) { pendingAudio.clear() }
         webSocket?.let { try { it.close(NORMAL_CLOSURE, "client closed") } catch (_: Exception) {} }
         webSocket = null
         onEvent(GeminiEvent.StateChanged(ConnectionState.IDLE))
