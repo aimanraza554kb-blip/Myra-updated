@@ -59,9 +59,12 @@ class GeminiLiveClient(
     // continuously across the 9-minute session renewal and across reconnects,
     // this gate is what actually prevents the mid-session 1007 disconnect loop.
     private val sessionReady = AtomicBoolean(false)
-
-    /** True only after the Live API setup handshake has completed. */
-    fun isSessionReady(): Boolean = sessionReady.get()
+    // Buffer a short microphone window while a fresh Live socket completes setup.
+    // This prevents the first spoken words after reopen/reconnect from being lost.
+    // VAD and response timing are intentionally unchanged.
+    private val pendingAudio = ArrayDeque<ByteArray>()
+    private val pendingAudioLock = Any()
+    private val maxPendingAudioFrames = 50
     // Prevents overlapping (re)connect attempts from opening duplicate sockets.
     private val connecting = AtomicBoolean(false)
     // Remembers the last frame type sent, so a 1007 close names the culprit.
@@ -88,6 +91,9 @@ class GeminiLiveClient(
             false
         }
     }
+
+    /** True when the current Live socket has completed the setup handshake. */
+    fun isSessionReady(): Boolean = sessionReady.get()
 
     fun connect(config: GeminiConfig) {
         this.config = config
@@ -165,6 +171,7 @@ class GeminiLiveClient(
         // completes and fully discard the previous socket so we never reuse a
         // half-dead session or leak a stale reference.
         sessionReady.set(false)
+        synchronized(pendingAudioLock) { pendingAudio.clear() }
         webSocket?.let { old ->
             webSocket = null
             try { old.cancel() } catch (_: Exception) {}
@@ -177,6 +184,7 @@ class GeminiLiveClient(
 
     private val listener = object : WebSocketListener() {
         override fun onOpen(ws: WebSocket, response: Response) {
+            if (webSocket !== ws) return
             connecting.set(false)
             Logger.i(TAG, "WebSocket open")
             reconnectAttempts = 0
@@ -187,15 +195,22 @@ class GeminiLiveClient(
             onEvent(GeminiEvent.Connected)
         }
 
-        override fun onMessage(ws: WebSocket, text: String) = handleMessage(text)
+        override fun onMessage(ws: WebSocket, text: String) {
+            if (webSocket !== ws) return
+            handleMessage(text)
+        }
 
-        override fun onMessage(ws: WebSocket, bytes: ByteString) = handleMessage(bytes.utf8())
+        override fun onMessage(ws: WebSocket, bytes: ByteString) {
+            if (webSocket !== ws) return
+            handleMessage(bytes.utf8())
+        }
 
         override fun onClosing(ws: WebSocket, code: Int, reason: String) {
             ws.close(NORMAL_CLOSURE, null)
         }
 
         override fun onClosed(ws: WebSocket, code: Int, reason: String) {
+            if (webSocket !== ws) return
             sessionReady.set(false)
             connecting.set(false)
             Logger.i(TAG, "WebSocket closed: $code '$reason' (last frame sent: $lastOutgoingLabel)")
@@ -209,6 +224,7 @@ class GeminiLiveClient(
         }
 
         override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
+            if (webSocket !== ws) return
             sessionReady.set(false)
             connecting.set(false)
             val detail = buildString {
@@ -243,42 +259,25 @@ class GeminiLiveClient(
             .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", cfg.systemInstruction))))
             .put("inputAudioTranscription", JSONObject())
             .put("outputAudioTranscription", JSONObject())
-
-        // Gemini 3.1 only accepts clientContent for initial history seeding.
-        // Enable that explicitly because reconnect/session renewal restores the
-        // current MYRA conversation immediately after setupComplete.
-        if (cfg.model == "gemini-3.1-flash-live-preview") {
-            setup.put(
-                "historyConfig",
-                JSONObject().put("initialHistoryInClientContent", true)
-            )
-            setup.put(
-                "generationConfig",
-                generationConfig.put(
-                    "thinkingConfig",
-                    JSONObject().put("thinkingLevel", "minimal")
-                )
-            )
-        }
             // Low-latency turn-taking: as soon as the user stops speaking we want a
             // reply almost immediately. Only the numeric VAD fields are set here.
             // NOTE: do NOT add startOfSpeechSensitivity/endOfSpeechSensitivity enums
             // - those were rejected by the Live API with close code 1007 ("invalid
             // argument"). The disabled/prefixPaddingMs/silenceDurationMs shape below
             // matches Google's documented working setup.
-        setup.put(
-            "realtimeInputConfig",
-            JSONObject().put(
-                "automaticActivityDetection",
-                JSONObject()
-                    .put("disabled", false)
-                    .put("prefixPaddingMs", 10)
-                    // Practically the floor: commit end-of-turn after ~2 silent
-                    // 20ms frames so MYRA starts replying almost instantly. Going
-                    // lower risks cutting the user off during natural pauses.
-                    .put("silenceDurationMs", 20)
+            .put(
+                "realtimeInputConfig",
+                JSONObject().put(
+                    "automaticActivityDetection",
+                    JSONObject()
+                        .put("disabled", false)
+                        .put("prefixPaddingMs", 10)
+                        // Practically the floor: commit end-of-turn after ~2 silent
+                        // 20ms frames so MYRA starts replying almost instantly. Going
+                        // lower risks cutting the user off during natural pauses.
+                        .put("silenceDurationMs", 40)
+                )
             )
-        )
 
         cfg.toolsJson?.takeIf { it.isNotBlank() }?.let { setup.put("tools", JSONArray(it)) }
 
@@ -296,17 +295,25 @@ class GeminiLiveClient(
 
     /** Stream a chunk of 16kHz mono PCM16 microphone audio to Gemini. */
     fun sendAudio(pcm: ByteArray) {
-        // Root-cause guard: never stream audio until the current session's setup
-        // handshake is acknowledged. This is what stops the mic from hitting a
-        // freshly-reconnected/renewed socket before setupComplete (the 1007).
-        if (!sessionReady.get()) return
         // Never forward empty or misaligned frames (PCM16 = 2 bytes/sample).
         if (pcm.isEmpty() || pcm.size % 2 != 0) return
+
+        // The recorder can start before Gemini sends setupComplete. Keep up to
+        // ~1 second of 20ms frames instead of silently dropping the utterance.
+        if (!sessionReady.get()) {
+            synchronized(pendingAudioLock) {
+                if (pendingAudio.size >= maxPendingAudioFrames) pendingAudio.removeFirst()
+                pendingAudio.addLast(pcm.copyOf())
+            }
+            return
+        }
+
+        sendAudioFrame(pcm)
+    }
+
+    private fun sendAudioFrame(pcm: ByteArray) {
         val b64 = Base64.encodeToString(pcm, Base64.NO_WRAP)
         if (b64.isBlank()) return
-        // Current Gemini Live WebSocket schema uses realtimeInput.audio directly.
-        // The older realtimeInput.mediaChunks field is deprecated and now causes
-        // server close 1007 (invalid argument).
         val audio = JSONObject()
             .put("mimeType", "audio/pcm;rate=" + Constants.INPUT_SAMPLE_RATE)
             .put("data", b64)
@@ -321,23 +328,6 @@ class GeminiLiveClient(
     fun sendText(text: String) {
         if (!sessionReady.get()) { Logger.w(TAG, "Drop text: session not ready"); return }
         if (text.isBlank()) return
-
-        // Gemini 3.1 uses realtimeInput.text for normal conversation turns.
-        // clientContent is reserved for initial history seeding on 3.1.
-        if (config?.model == "gemini-3.1-flash-live-preview") {
-            val message = JSONObject().put(
-                "realtimeInput",
-                JSONObject().put("text", text)
-            )
-            if (safeSend(message.toString(), "text")) {
-                synchronized(historyLock) {
-                    pendingUserText.append(text)
-                }
-            }
-            return
-        }
-
-        // Preserve the original 2.5 Live behavior.
         val turn = JSONObject()
             .put("role", "user")
             .put("parts", JSONArray().put(JSONObject().put("text", text)))
@@ -377,6 +367,12 @@ class GeminiLiveClient(
                 // Handshake done: it is now safe to stream audio and tool results.
                 sessionReady.set(true)
                 restoreConversationHistory()
+                val queuedAudio = synchronized(pendingAudioLock) {
+                    val copy = pendingAudio.toList()
+                    pendingAudio.clear()
+                    copy
+                }
+                queuedAudio.forEach { sendAudioFrame(it) }
                 onEvent(GeminiEvent.SetupComplete)
                 return
             }
@@ -504,6 +500,7 @@ class GeminiLiveClient(
         sessionReady.set(false)
         connecting.set(false)
         renewJob?.cancel()
+        synchronized(pendingAudioLock) { pendingAudio.clear() }
         webSocket?.let { try { it.close(NORMAL_CLOSURE, "client closed") } catch (_: Exception) {} }
         webSocket = null
         onEvent(GeminiEvent.StateChanged(ConnectionState.IDLE))
