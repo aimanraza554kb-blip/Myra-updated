@@ -19,6 +19,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * WebSocket client for the Gemini Live API (BidiGenerateContent). Handles setup,
@@ -61,6 +62,9 @@ class GeminiLiveClient(
     private val sessionReady = AtomicBoolean(false)
     // Prevents overlapping (re)connect attempts from opening duplicate sockets.
     private val connecting = AtomicBoolean(false)
+    // Identifies the current connect lifecycle so callbacks/coroutines from an
+    // older socket cannot resurrect a session after the app has been reopened.
+    private val lifecycleGeneration = AtomicLong(0)
     // Remembers the last frame type sent, so a 1007 close names the culprit.
     @Volatile private var lastOutgoingLabel: String = "none"
 
@@ -88,12 +92,16 @@ class GeminiLiveClient(
 
     fun connect(config: GeminiConfig) {
         this.config = config
+        val generation = lifecycleGeneration.incrementAndGet()
         running.set(true)
         reconnectAttempts = 0
         // Model discovery + socket open both do blocking network I/O, so keep
         // them off the Default (CPU) dispatcher to avoid stalling other work.
         scope.launch(Dispatchers.IO) {
             resolveWorkingModel(config)
+            // If the app was closed/reopened while model discovery was running,
+            // this old coroutine must not open a second/stale socket.
+            if (!running.get() || lifecycleGeneration.get() != generation) return@launch
             openSocket()
         }
     }
@@ -174,6 +182,10 @@ class GeminiLiveClient(
 
     private val listener = object : WebSocketListener() {
         override fun onOpen(ws: WebSocket, response: Response) {
+            if (webSocket !== ws || !running.get()) {
+                try { ws.cancel() } catch (_: Exception) {}
+                return
+            }
             connecting.set(false)
             Logger.i(TAG, "WebSocket open")
             reconnectAttempts = 0
@@ -184,15 +196,26 @@ class GeminiLiveClient(
             onEvent(GeminiEvent.Connected)
         }
 
-        override fun onMessage(ws: WebSocket, text: String) = handleMessage(text)
+        override fun onMessage(ws: WebSocket, text: String) {
+            if (webSocket !== ws || !running.get()) return
+            handleMessage(text)
+        }
 
-        override fun onMessage(ws: WebSocket, bytes: ByteString) = handleMessage(bytes.utf8())
+        override fun onMessage(ws: WebSocket, bytes: ByteString) {
+            if (webSocket !== ws || !running.get()) return
+            handleMessage(bytes.utf8())
+        }
 
         override fun onClosing(ws: WebSocket, code: Int, reason: String) {
+            if (webSocket !== ws) return
             ws.close(NORMAL_CLOSURE, null)
         }
 
         override fun onClosed(ws: WebSocket, code: Int, reason: String) {
+            // Ignore callbacks from an old socket after a close/reopen cycle.
+            // Without this guard, the old socket can schedule a reconnect and
+            // replace the newly opened session, causing silent Listening state.
+            if (webSocket !== ws) return
             sessionReady.set(false)
             connecting.set(false)
             Logger.i(TAG, "WebSocket closed: $code '$reason' (last frame sent: $lastOutgoingLabel)")
@@ -206,6 +229,8 @@ class GeminiLiveClient(
         }
 
         override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
+            // A failed stale socket must never reconnect over the current one.
+            if (webSocket !== ws) return
             sessionReady.set(false)
             connecting.set(false)
             val detail = buildString {
@@ -296,9 +321,6 @@ class GeminiLiveClient(
         )
         safeSend(message.toString(), "audio")
     }
-
-    /** True when the WebSocket session has completed setup. */
-    fun isSessionReady(): Boolean = sessionReady.get()
 
     /** Send a typed text turn (used by the chat input box). */
     fun sendText(text: String) {
@@ -469,9 +491,11 @@ class GeminiLiveClient(
         running.set(false)
         sessionReady.set(false)
         connecting.set(false)
+        lifecycleGeneration.incrementAndGet()
         renewJob?.cancel()
-        webSocket?.let { try { it.close(NORMAL_CLOSURE, "client closed") } catch (_: Exception) {} }
+        val oldSocket = webSocket
         webSocket = null
+        oldSocket?.let { try { it.close(NORMAL_CLOSURE, "client closed") } catch (_: Exception) {} }
         onEvent(GeminiEvent.StateChanged(ConnectionState.IDLE))
     }
 
