@@ -244,20 +244,11 @@ class GeminiLiveClient(
             .put("inputAudioTranscription", JSONObject())
             .put("outputAudioTranscription", JSONObject())
 
-        // Gemini 3.1 supports initial history via clientContent, but the server
-        // enters a special waiting state when initialHistoryInClientContent=true.
-        // Therefore ONLY enable it when this client actually has history to send.
-        // On a brand-new session the history is empty; enabling it then would make
-        // the server wait forever for a history message and ignore live microphone
-        // input, leaving MYRA stuck on "Listening..." with no response.
+        // Gemini 3.1 thinking stays minimal for low-latency voice replies.
+        // Conversation history is restored AFTER setupComplete via clientContent;
+        // do not enable initialHistoryInClientContent in setup because it can put
+        // a freshly opened Live session into an initial-history waiting state.
         if (cfg.model == "gemini-3.1-flash-live-preview") {
-            val hasInitialHistory = synchronized(historyLock) { history.isNotEmpty() }
-            if (hasInitialHistory) {
-                setup.put(
-                    "historyConfig",
-                    JSONObject().put("initialHistoryInClientContent", true)
-                )
-            }
             setup.put(
                 "generationConfig",
                 generationConfig.put(
