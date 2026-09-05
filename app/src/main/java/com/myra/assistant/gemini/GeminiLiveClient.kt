@@ -218,6 +218,16 @@ class GeminiLiveClient(
             .put("responseModalities", JSONArray().put("AUDIO"))
             .put("speechConfig", speechConfig)
 
+        // Gemini 3.1 uses thinkingLevel (not the 2.5 thinkingBudget field).
+        // Keep it at the documented lowest-latency level while leaving every
+        // user-facing setting (model, voice, personality, language) untouched.
+        if (cfg.model == "gemini-3.1-flash-live-preview") {
+            generationConfig.put(
+                "thinkingConfig",
+                JSONObject().put("thinkingLevel", "minimal")
+            )
+        }
+
         initialHistoryConfigured = cfg.model == "gemini-3.1-flash-live-preview" && synchronized(historyLock) {
             history.isNotEmpty()
         }
