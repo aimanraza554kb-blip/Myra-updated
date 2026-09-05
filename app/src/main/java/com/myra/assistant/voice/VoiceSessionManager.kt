@@ -1,6 +1,7 @@
 package com.myra.assistant.voice
 
 import android.content.Context
+import android.os.SystemClock
 import com.myra.assistant.audio.AudioPlayer
 import com.myra.assistant.audio.AudioRecorder
 import com.myra.assistant.audio.VoiceActivityDetector
@@ -76,20 +77,23 @@ class VoiceSessionManager(
     private val inputBuffer = StringBuilder()
     private val outputBuffer = StringBuilder()
 
+    @Volatile private var localSpeechActive = false
+    @Volatile private var lastSpeechAtMs = 0L
+    private var audioEndSentForTurn = false
+    private val audioVADLock = Any()
+
     fun start() {
         if (_active.value) {
-            // The foreground service can survive an Activity/task restart. In that
-            // case the manager may still say "active" while the old Live session
-            // is no longer usable. Rebuild the session instead of silently doing
-            // nothing, which is what caused MYRA to stop responding after reopen.
+            val state = _connectionState.value
             val ready = client?.isSessionReady() == true
-            val audioReady = recorder != null && player != null
-            if (ready && audioReady) return
-
-            Logger.w(TAG, "Active session is stale; restarting Gemini/audio resources")
-            stop()
+            val healthy = ready || state == ConnectionState.CONNECTING ||
+                state == ConnectionState.CONNECTED || state == ConnectionState.RECONNECTING
+            if (healthy) return
+            Logger.w(TAG, "Active MYRA session is stale ($state); rebuilding it")
+            stop(notifyStopped = false)
         }
         _active.value = true
+        _connectionState.value = ConnectionState.CONNECTING
         scope.launch {
             val personality = settings.personality()
             val memoryBlock = memory.contextBlock()
@@ -143,8 +147,36 @@ class VoiceSessionManager(
 
             val micRecorder = AudioRecorder(
                 onChunk = { pcm ->
-                    _amplitude.value = vad.amplitude(pcm)
-                    if (!_micMuted.value) geminiClient.sendAudio(pcm)
+                    val amplitude = vad.amplitude(pcm)
+                    _amplitude.value = amplitude
+                    if (!_micMuted.value) {
+                        val now = SystemClock.elapsedRealtime()
+                        val speech = vad.isSpeech(pcm)
+                        var shouldSend = true
+                        var shouldEnd = false
+                        synchronized(audioVADLock) {
+                            if (speech) {
+                                localSpeechActive = true
+                                lastSpeechAtMs = now
+                                audioEndSentForTurn = false
+                                shouldSend = true
+                            } else if (localSpeechActive) {
+                                shouldSend = true
+                                if (!audioEndSentForTurn && now - lastSpeechAtMs >= LOCAL_SILENCE_MS) {
+                                    audioEndSentForTurn = true
+                                    localSpeechActive = false
+                                    shouldEnd = true
+                                    shouldSend = false
+                                }
+                            } else if (audioEndSentForTurn) {
+                                // After audioStreamEnd, don't immediately reopen the
+                                // stream with silence. Reopen it on the next speech chunk.
+                                shouldSend = false
+                            }
+                        }
+                        if (shouldSend) geminiClient.sendAudio(pcm)
+                        if (shouldEnd) geminiClient.sendAudioStreamEnd()
+                    }
                 },
                 onError = { message ->
                     // Surface mic failures honestly instead of appearing to listen.
@@ -158,15 +190,10 @@ class VoiceSessionManager(
         }
     }
 
-    /** Ensure the existing foreground-service session is actually usable. */
-    fun ensureStarted() {
-        start()
-    }
-
-    /** Restart the Live session so changed settings are applied immediately. */
+    /** Restart the Live session so changed settings and stale connections are rebuilt cleanly. */
     fun restart() {
         if (!_active.value) return
-        Logger.i(TAG, "Restarting session to apply changed settings")
+        Logger.i(TAG, "Restarting Live session")
         stop(notifyStopped = false)
         start()
     }
@@ -178,6 +205,11 @@ class VoiceSessionManager(
                 _lastError.value = ""
             }
             is GeminiEvent.SetupComplete -> {
+                synchronized(audioVADLock) {
+                    localSpeechActive = false
+                    lastSpeechAtMs = 0L
+                    audioEndSentForTurn = false
+                }
                 _connectionState.value = ConnectionState.LISTENING
                 recorder?.start()
             }
@@ -207,6 +239,11 @@ class VoiceSessionManager(
                     _inputTranscript.value = ""
                     _outputTranscript.value = ""
                     player?.flush()
+                    synchronized(audioVADLock) {
+                        localSpeechActive = false
+                        lastSpeechAtMs = 0L
+                        audioEndSentForTurn = false
+                    }
                 }
                 _connectionState.value = event.state
             }
@@ -227,6 +264,11 @@ class VoiceSessionManager(
         outputBuffer.setLength(0)
         _inputTranscript.value = ""
         _outputTranscript.value = ""
+        synchronized(audioVADLock) {
+            localSpeechActive = false
+            lastSpeechAtMs = 0L
+            audioEndSentForTurn = false
+        }
         _connectionState.value = ConnectionState.LISTENING
         scope.launch {
             if (userText.isNotEmpty()) conversation.add(ChatMessage.Role.USER, userText)
@@ -277,7 +319,7 @@ class VoiceSessionManager(
     /** Interrupt MYRA while she is speaking. */
     fun interrupt() = player?.flush()
 
-    fun stop(notifyStopped: Boolean = true) {
+    fun stop() {
         _active.value = false
         recorder?.stop(); recorder = null
         player?.stop(); player = null
@@ -288,8 +330,16 @@ class VoiceSessionManager(
         _outputTranscript.value = ""
         _connectionState.value = ConnectionState.IDLE
         _amplitude.value = 0f
-        if (notifyStopped) onSessionStopped?.invoke()
+        synchronized(audioVADLock) {
+            localSpeechActive = false
+            lastSpeechAtMs = 0L
+            audioEndSentForTurn = false
+        }
+        onSessionStopped?.invoke()
     }
 
-    companion object { private const val TAG = "VoiceSessionManager" }
+    companion object {
+        private const val TAG = "VoiceSessionManager"
+        private const val LOCAL_SILENCE_MS = 450L
+    }
 }
