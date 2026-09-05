@@ -59,6 +59,9 @@ class GeminiLiveClient(
     // continuously across the 9-minute session renewal and across reconnects,
     // this gate is what actually prevents the mid-session 1007 disconnect loop.
     private val sessionReady = AtomicBoolean(false)
+
+    /** True only after the Live API setup handshake has completed. */
+    fun isSessionReady(): Boolean = sessionReady.get()
     // Prevents overlapping (re)connect attempts from opening duplicate sockets.
     private val connecting = AtomicBoolean(false)
     // Remembers the last frame type sent, so a 1007 close names the culprit.
