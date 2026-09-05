@@ -263,19 +263,19 @@ class GeminiLiveClient(
             // - those were rejected by the Live API with close code 1007 ("invalid
             // argument"). The disabled/prefixPaddingMs/silenceDurationMs shape below
             // matches Google's documented working setup.
-            .put(
-                "realtimeInputConfig",
-                JSONObject().put(
-                    "automaticActivityDetection",
-                    JSONObject()
-                        .put("disabled", false)
-                        .put("prefixPaddingMs", 10)
-                        // Practically the floor: commit end-of-turn after ~2 silent
-                        // 20ms frames so MYRA starts replying almost instantly. Going
-                        // lower risks cutting the user off during natural pauses.
-                        .put("silenceDurationMs", 20)
-                )
+        setup.put(
+            "realtimeInputConfig",
+            JSONObject().put(
+                "automaticActivityDetection",
+                JSONObject()
+                    .put("disabled", false)
+                    .put("prefixPaddingMs", 10)
+                    // Practically the floor: commit end-of-turn after ~2 silent
+                    // 20ms frames so MYRA starts replying almost instantly. Going
+                    // lower risks cutting the user off during natural pauses.
+                    .put("silenceDurationMs", 20)
             )
+        )
 
         cfg.toolsJson?.takeIf { it.isNotBlank() }?.let { setup.put("tools", JSONArray(it)) }
 
