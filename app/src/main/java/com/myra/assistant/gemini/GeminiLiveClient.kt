@@ -42,7 +42,6 @@ class GeminiLiveClient(
     private val running = AtomicBoolean(false)
     private var reconnectAttempts = 0
     private var renewJob: Job? = null
-    private var stableConnectionJob: Job? = null
 
     // Keep a small rolling conversation history locally so a planned Live-session
     // renewal/reconnect does not make MYRA forget the current conversation.
@@ -65,6 +64,14 @@ class GeminiLiveClient(
     private val connecting = AtomicBoolean(false)
     // Remembers the last frame type sent, so a 1007 close names the culprit.
     @Volatile private var lastOutgoingLabel: String = "none"
+
+    // Gemini Live can intentionally reset/close a WebSocket. For 3.1, keep the
+    // latest server-issued resumption handle so a transient 1011 can resume the
+    // same Live session instead of creating a blank new session.
+    @Volatile private var sessionResumptionHandle: String? = null
+    @Volatile private var resumingSession = false
+    @Volatile private var lastClosingCode: Int? = null
+    @Volatile private var lastClosingReason: String = ""
 
     /**
      * Single choke-point for every outgoing frame: refuses to send on a dead or
@@ -137,6 +144,9 @@ class GeminiLiveClient(
         // half-dead session or leak a stale reference.
         sessionReady.set(false)
         initialHistoryConfigured = false
+        resumingSession = cfg.model == "gemini-3.1-flash-live-preview" && !sessionResumptionHandle.isNullOrBlank()
+        lastClosingCode = null
+        lastClosingReason = ""
         webSocket?.let { old ->
             webSocket = null
             try { old.cancel() } catch (_: Exception) {}
@@ -151,21 +161,13 @@ class GeminiLiveClient(
         override fun onOpen(ws: WebSocket, response: Response) {
             if (webSocket !== ws) return
             connecting.set(false)
-            Logger.i(TAG, "WebSocket open")
-            // Keep reconnect backoff across short-lived 3.1 sessions. Reset it
-            // only after the connection has remained healthy for 60 seconds.
-            stableConnectionJob?.cancel()
-            stableConnectionJob = scope.launch {
-                delay(STABLE_CONNECTION_RESET_MS)
-                if (webSocket === ws && sessionReady.get() && running.get()) {
-                    reconnectAttempts = 0
-                    Logger.d(TAG, "Connection stable; reconnect backoff reset")
-                }
-            }
+            Logger.i(TAG, "WebSocket open${if (resumingSession) " (resuming 3.1 session)" else ""}")
+            // Do not reset reconnectAttempts here. A socket can open successfully
+            // and still die during setup/first turn; resetting here would create an
+            // endless fast reconnect loop. Reset only after setupComplete.
             // Setup MUST be the first frame; sessionReady stays false until the
             // server acknowledges it with setupComplete.
             sendSetup(ws)
-            scheduleRenew()
             onEvent(GeminiEvent.Connected)
         }
 
@@ -181,31 +183,27 @@ class GeminiLiveClient(
 
         override fun onClosing(ws: WebSocket, code: Int, reason: String) {
             if (webSocket !== ws) return
-            ws.close(NORMAL_CLOSURE, null)
+            // Preserve the server close code/reason. In particular, OkHttp may
+            // report 1000 from onClosed after the peer has sent 1011.
+            lastClosingCode = code
+            lastClosingReason = reason
+            try { ws.close(code, reason) } catch (_: Exception) {}
         }
 
         override fun onClosed(ws: WebSocket, code: Int, reason: String) {
             if (webSocket !== ws) return
             sessionReady.set(false)
             connecting.set(false)
-            stableConnectionJob?.cancel()
-            Logger.i(TAG, "WebSocket closed: $code '$reason' (last frame sent: $lastOutgoingLabel)")
-            val renewing = reason == "renew"
-
-            // Gemini 3.1 Live can intermittently close a healthy session with
-            // WebSocket 1011. Treat that close as transient and recover using the
-            // existing exponential backoff instead of leaving MYRA stuck.
-            if (code == 1011 && running.get()) {
-                Logger.w(TAG, "Gemini Live 1011; reconnecting with backoff")
-                reconnect(immediate = false)
-                return
+            val actualCode = lastClosingCode ?: code
+            val actualReason = lastClosingReason.ifBlank { reason }
+            Logger.i(TAG, "WebSocket closed: $actualCode '$actualReason' (last frame sent: $lastOutgoingLabel)")
+            val renewing = actualReason == "renew"
+            if (actualCode != NORMAL_CLOSURE && actualReason.isNotBlank() && !renewing) {
+                onEvent(GeminiEvent.Error("Server closed ($actualCode): $actualReason"))
             }
-
-            if (code != NORMAL_CLOSURE && reason.isNotBlank() && !renewing) {
-                onEvent(GeminiEvent.Error("Server closed ($code): $reason"))
-            }
-            // A planned session renewal should reconnect instantly and silently;
-            // only genuine drops use exponential backoff.
+            // A planned renewal reconnects immediately. A transient server close
+            // (including 1011) uses backoff and, for 3.1, resumes the last session
+            // when Google has supplied a valid resumption handle.
             if (running.get()) reconnect(immediate = renewing) else onEvent(GeminiEvent.Closed)
         }
 
@@ -249,9 +247,9 @@ class GeminiLiveClient(
             )
         }
 
-        initialHistoryConfigured = cfg.model == "gemini-3.1-flash-live-preview" && synchronized(historyLock) {
-            history.isNotEmpty()
-        }
+        initialHistoryConfigured = cfg.model == "gemini-3.1-flash-live-preview" &&
+            !resumingSession &&
+            synchronized(historyLock) { history.isNotEmpty() }
 
         // The personality selected in Settings is authoritative. Do not rewrite,
         // censor, or substitute the user's selected personality for Gemini 3.1.
@@ -281,6 +279,12 @@ class GeminiLiveClient(
                         .put("silenceDurationMs", 40)
                 )
             )
+
+        if (cfg.model == "gemini-3.1-flash-live-preview") {
+            val resume = JSONObject()
+            sessionResumptionHandle?.takeIf { it.isNotBlank() }?.let { resume.put("handle", it) }
+            setup.put("sessionResumption", resume)
+        }
 
         if (initialHistoryConfigured) {
             setup.put(
@@ -396,10 +400,26 @@ class GeminiLiveClient(
                 if (isQuotaOrRateLimit(detail)) running.set(false)
                 return
             }
+            obj.optJSONObject("sessionResumptionUpdate")?.let { update ->
+                val resumable = update.optBoolean("resumable", false)
+                val handle = update.optString("newHandle", "")
+                if (resumable && handle.isNotBlank()) {
+                    sessionResumptionHandle = handle
+                    Logger.d(TAG, "Updated 3.1 session resumption handle")
+                } else if (!resumable) {
+                    Logger.d(TAG, "3.1 session is not resumable at this point")
+                }
+            }
+
             if (obj.has("setupComplete")) {
                 // Handshake done: it is now safe to stream audio and tool results.
+                // This is the first point at which a reconnect is known to be
+                // healthy, so only now reset the backoff counter.
                 sessionReady.set(true)
-                restoreConversationHistory()
+                reconnectAttempts = 0
+                scheduleRenew()
+                if (!resumingSession) restoreConversationHistory()
+                resumingSession = false
                 onEvent(GeminiEvent.SetupComplete)
                 return
             }
@@ -419,6 +439,10 @@ class GeminiLiveClient(
                     }
                     if (calls.isNotEmpty()) onEvent(GeminiEvent.ToolCall(calls))
                 }
+                return
+            }
+            obj.optJSONObject("goAway")?.let { goAway ->
+                Logger.i(TAG, "Gemini requested WebSocket shutdown: ${goAway.optString("timeLeft", "unknown")}")
                 return
             }
             if (obj.has("serverContent")) {
@@ -510,7 +534,6 @@ class GeminiLiveClient(
     private fun reconnect(immediate: Boolean = false) {
         onEvent(GeminiEvent.StateChanged(ConnectionState.RECONNECTING))
         renewJob?.cancel()
-        stableConnectionJob?.cancel()
         scope.launch(Dispatchers.IO) {
             val delayMs = if (immediate) 0L else
                 (Constants.RECONNECT_BASE_DELAY_MS * (1L shl reconnectAttempts.coerceAtMost(5)))
@@ -538,7 +561,8 @@ class GeminiLiveClient(
         sessionReady.set(false)
         connecting.set(false)
         renewJob?.cancel()
-        stableConnectionJob?.cancel()
+        sessionResumptionHandle = null
+        resumingSession = false
         webSocket?.let { try { it.close(NORMAL_CLOSURE, "client closed") } catch (_: Exception) {} }
         webSocket = null
         onEvent(GeminiEvent.StateChanged(ConnectionState.IDLE))
@@ -547,7 +571,6 @@ class GeminiLiveClient(
     companion object {
         private const val TAG = "GeminiLiveClient"
         private const val NORMAL_CLOSURE = 1000
-        private const val STABLE_CONNECTION_RESET_MS = 60_000L
         // Cache is scoped by API key + requested model so changing the model in
         // Settings never reuses a previous model choice for the same key.
         private val modelCache = java.util.concurrent.ConcurrentHashMap<String, String>()
